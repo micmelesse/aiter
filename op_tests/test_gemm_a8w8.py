@@ -137,7 +137,6 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=0):
             dtype=x.dtype,
             device=x.device,
         )
-        x_full.zero_()
         x_full[:, :k] = x
         x_asm = x_full[:, :k]
     else:
@@ -145,7 +144,6 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=0):
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
     err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
-    print(x_asm.shape, x_asm.stride(),x_asm.stride()[0],x_asm.stride()[1]) 
     # Only run ASM kernel with 16x16 shuffle.
     weightshuffle_asm = shuffle_weight(weight, layout=(16, 16))
     bias_f32 = bias.to(dtypes.fp32)
@@ -354,8 +352,8 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
-l_dtype = ["bf16"]
-l_quantDtype = ["i8"]
+l_dtype = ["bf16", "fp16"]
+l_quantDtype = ["i8", "fp8"]
 l_mnk_nm = [
     # qkv_proj
     (1, 1280, 8192),
@@ -452,3 +450,4 @@ if args.mnk is not None:
 test_normal_gemm_a8w8_pertoken_quant(
     l_dtype, l_quantDtype, l_mnk_nm, pad_a=args.pad_a
 )
+# test_skinny_gemm_a8w8_pertoken_quant()
