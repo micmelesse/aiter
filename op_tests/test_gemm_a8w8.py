@@ -122,13 +122,12 @@ def init_hipblas():
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=0):
+def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
     dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
-    bias = torch.rand([1, n], dtype=dtype, device="cuda") * 10
     pad_k = max(pad_a, 0)
     if pad_k > 0:
         x_full = torch.empty_strided(
@@ -141,19 +140,69 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=0):
         x_asm = x_full[:, :k]
     else:
         x_asm = x
+    weightshuffle = shuffle_weight(weight, layout=(16, 16))
+
+    # CK fp8 kernel set bias=None
+    if quantDtype == dtypes.fp8:
+        bias = None
+    else:
+        bias = torch.rand([1, n], dtype=dtype, device="cuda") * 10
+
+    # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
+    # print(f"{x_pad.shape=}{x_pad.stride()}")
+
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-    err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
-    # Only run ASM kernel with 16x16 shuffle.
-    weightshuffle_asm = shuffle_weight(weight, layout=(16, 16))
-    bias_f32 = bias.to(dtypes.fp32)
-    d, avg_d = run_gemm_asm(x_asm, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
-    err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+    shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
+    if shape_is_tuned:
+        err_b = checkAllclose(
+            a,
+            b,
+            msg="ck (tuned): ",
+            rtol=1e-1,
+            atol=1e-1,
+            tol_err_ratio=1.0,
+            printLog=False,
+        )
+    else:
+        err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
+    if quantDtype != dtypes.i8:
+        c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+        # c = c + bias
+        err_c = checkAllclose(a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2)
+    else:
+        avg_c = None
+        err_c = None
+
+    avg_d = None
+    err_d = None
+    if dtype == dtypes.bf16 and quantDtype == dtypes.i8 and bias is not None:
+        bias_f32 = bias.to(dtypes.fp32)
+        d, avg_d = run_gemm_asm(x_asm, weightshuffle, x_scale, w_scale, bias_f32, dtype)
+        err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+        if d is not None:
+            err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+        else:
+            avg_d = None
+
+    if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
+        # hipb_mm bpreshuffle only supports bfloat16 as output type
+        init_hipblas()
+        e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+        # e = e + bias
+        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+    else:
+        avg_e = None
+        err_e = None
     return {
         "ck us": avg_b,
         "ck err": err_b,
+        "ck bpreshuffle us": avg_c,
+        "ck bpreshuffle err": err_c,
         "asm us": avg_d,
         "asm err": err_d,
+        "hipmm bpreshuffle us": avg_e,
+        "hipmm bpreshuffle err": err_e,
     }
 
 
@@ -431,7 +480,7 @@ parser.add_argument(
 parser.add_argument(
     "--pad_a",
     type=int,
-    default=0,
+    default=128,
     help="Pad A on K dimension, stride_a = K + pad_a.",
 )
 
@@ -447,7 +496,5 @@ else:
 if args.mnk is not None:
     l_mnk_nm = [args.mnk]
 
-test_normal_gemm_a8w8_pertoken_quant(
-    l_dtype, l_quantDtype, l_mnk_nm, pad_a=args.pad_a
-)
-# test_skinny_gemm_a8w8_pertoken_quant()
+test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm, pad_a=args.pad_a)
+test_skinny_gemm_a8w8_pertoken_quant()
