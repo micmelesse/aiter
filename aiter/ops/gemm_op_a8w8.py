@@ -45,7 +45,8 @@ def gemm_a8w8_ck(
     Out: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
@@ -69,7 +70,8 @@ def gemm_a8w8_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
@@ -93,7 +95,8 @@ def gemm_a8w8_bpreshuffle_cktile(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor: ...
+) -> Tensor:
+    ...
 
 
 def gen_gemm_a8w8_asm_fake_tensors(
@@ -125,7 +128,8 @@ def gemm_a8w8_asm(
     bias: Optional[Tensor],  # bias:[1, N] f32
     bpreshuffle: Optional[bool] = True,
     splitK: Optional[int] = None,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def gen_gemm_a8w8_blockscale_ck_fake_tensors(
@@ -149,7 +153,8 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops(
@@ -163,7 +168,8 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops(
@@ -177,7 +183,8 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
@@ -201,7 +208,8 @@ def flatmm_a8w8_blockscale_asm(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor: ...
+) -> Tensor:
+    ...
 
 
 def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
@@ -233,7 +241,8 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
     bpreshuffle: Optional[bool] = True,
-) -> Tensor: ...
+) -> Tensor:
+    ...
 
 
 def gen_gfx950_a8w8_blockscale_asm_fake_tensors(
@@ -257,7 +266,8 @@ def gfx950_a8w8_blockscale_asm(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor: ...
+) -> Tensor:
+    ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -322,10 +332,10 @@ def get_GEMM_config_with_quant_type(
     # Load file if not cached
     if tuned_file not in get_GEMM_config_with_quant_type.file_cache:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
-            asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
-                "index"
-            )
+        get_GEMM_config_with_quant_type.file_cache[
+            tuned_file
+        ] = asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
+            "index"
         )
 
     cu_num = get_cu_num()
@@ -666,7 +676,8 @@ def gemm_a8w8_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def gen_gemm_a8w8_blockscale_tune_fake_tensors(
@@ -694,7 +705,8 @@ def gemm_a8w8_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops(
@@ -710,7 +722,8 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops(
@@ -726,7 +739,8 @@ def gemm_a8w8_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops(
@@ -742,7 +756,8 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops(
@@ -757,4 +772,5 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
     out: Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> Tensor: ...
+) -> Tensor:
+    ...
