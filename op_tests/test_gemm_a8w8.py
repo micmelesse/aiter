@@ -482,6 +482,12 @@ parser.add_argument(
     default=128,
     help="Pad A on K dimension, stride_a = K + pad_a.",
 )
+parser.add_argument(
+    "--asm_kernel",
+    type=str,
+    default=ASM_KERNEL_NAME,
+    help="Override asm kernel symbol name for gemm_a8w8_asm.",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -495,5 +501,7 @@ else:
 if args.mnk is not None:
     l_mnk_nm = [args.mnk]
 
+ASM_KERNEL_NAME = args.asm_kernel
+
 test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm, pad_a=args.pad_a)
-test_skinny_gemm_a8w8_pertoken_quant()
+# test_skinny_gemm_a8w8_pertoken_quant()
