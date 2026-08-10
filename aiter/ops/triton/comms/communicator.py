@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 
 
+# The module the HIP backend's kernel comes from. Named ONCE: aiter's csrc carries no comms at all
+# (it is GEMM/CK), so the kernel ships as its own extension the way iris does, and only this constant
+# changes if that home changes.
+_HIP_COMMS_MODULE = "aiter_hip_comms"
+
+
+def _hip_comms_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec(_HIP_COMMS_MODULE) is not None
+
+
 def _iris_available() -> bool:
     try:
         import iris  # noqa: F401
@@ -407,6 +419,125 @@ class DummyCommunicator(Communicator):
         yield
 
 
+class HipCommunicator(Communicator):
+    """Communicator backed by a HIP all-reduce kernel we own.
+
+    The point of this backend is CONTROL, not (yet) speed. The iris backend's
+    performance depends on someone else's kernel schedule; this one is ours, so it
+    can be pushed as hard as the hardware allows without waiting on anyone. Its v1
+    target is therefore PARITY with the incumbent, not beating it -- it is the
+    platform every later comms experiment runs on.
+
+    ALGORITHM (decided by measurement, 2026-07-30, not by preference): TWO-STAGE
+    (reduce-scatter then all-gather), not one-shot. At the decode operating point
+    a TP=8 all-reduce moves [64, 8192] bf16 = 1 MiB, and there a one-shot moves
+    ~4x the bytes of a two-stage; measured, iris's `one_shot_all_reduce_gluon` ran
+    ~37.8us against baseline's two-stage at ~22.2us on the same run. A one-shot
+    only pays below ~1 MiB, so it is the wrong starting algorithm for this
+    workload -- worth revisiting only if the message shrinks (lower concurrency or
+    a smaller hidden dim).
+
+    STATUS: the seam, not the kernel. The class self-disables while the kernel
+    module is absent, exactly as `IrisCommunicator` self-disables without `iris`,
+    so `AITER_COMMS_BACKEND=hip` is already selectable and inert rather than
+    broken. The collectives raise until the kernel lands, which cannot be reached
+    through vLLM because `should_*` gates on `disabled` first -- and a raise is the
+    right behaviour for anything that bypasses the gate.
+    """
+
+    # Matches IrisCommunicator: a two-stage reduce-scatter needs the element count
+    # divisible by the world size, and these are the TP widths we actually run.
+    _SUPPORTED_WORLD_SIZES = [2, 4, 8]
+    _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
+
+    def __init__(
+        self,
+        cpu_group: ProcessGroup,
+        device_group: ProcessGroup,
+        device: Union[int, str, torch.device],
+        max_size: int = _DEFAULT_MAX_SIZE,
+    ) -> None:
+        # Disabled FIRST, so every early return below leaves a safe object rather
+        # than one whose disabled flag depends on how far __init__ got.
+        self.disabled = True
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        assert isinstance(device, torch.device)
+        self.cpu_group = cpu_group
+        self.device_group = device_group
+        self.device = device
+        self.max_size = max_size
+        self.world_size = dist.get_world_size(device_group)
+
+        if not _hip_comms_available():
+            logger.info(
+                "aiter HipCommunicator disabled: %s is not importable",
+                _HIP_COMMS_MODULE,
+            )
+            return
+        if not _rocm_arch_available():
+            logger.info("aiter HipCommunicator disabled: unsupported ROCm arch")
+            return
+        if self.world_size not in self._SUPPORTED_WORLD_SIZES:
+            logger.info(
+                "aiter HipCommunicator disabled: world_size=%d not in %s",
+                self.world_size,
+                self._SUPPORTED_WORLD_SIZES,
+            )
+            return
+        self.disabled = False
+
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
+        # The SAME admission rules as IrisCommunicator, deliberately: two backends
+        # that accept different tensors are not comparable, and the whole reason
+        # this one exists is to be measured against that one.
+        if self.disabled:
+            return False
+        if not _is_weak_contiguous(inp):
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size % 16 != 0:
+            return False
+        if inp_size >= self.max_size:
+            return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
+        # A two-stage reduce-scatter splits the buffer across ranks, so a count
+        # that does not divide is a correctness hazard rather than a slow path.
+        if inp.numel() % self.world_size != 0:
+            return False
+        return True
+
+    def should_allgather(self, inp: torch.Tensor) -> bool:
+        if self.disabled:
+            return False
+        if not _is_weak_contiguous(inp):
+            return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
+        return True
+
+    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "HipCommunicator.all_reduce: the HIP kernel is not implemented yet. "
+            "This is unreachable through vLLM (should_allreduce gates on disabled), "
+            "so reaching it means the gate was bypassed."
+        )
+
+    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        raise NotImplementedError(
+            "HipCommunicator.all_gather: the HIP kernel is not implemented yet."
+        )
+
+    @contextmanager
+    def capture(self) -> Iterator[None]:
+        # Nothing to register while there is no kernel. The two-stage design will
+        # want its peer buffers registered here, which is why the hook exists now.
+        yield
+
+
 def make_communicator(
     cpu_group: ProcessGroup,
     device_group: ProcessGroup,
@@ -422,7 +553,8 @@ def make_communicator(
     the torch reference runs its collectives over ``device_group``; iris uses
     neither (its own symmetric-heap CCL).
 
-    'iris' is the gluon GPU-initiated CCL; 'torch' is the torch.distributed
+    'iris' is the gluon GPU-initiated CCL; 'hip' is our own HIP kernel (the backend
+    we control, so its schedule is not someone else's); 'torch' is the torch.distributed
     reference/control; 'dummy' is a no-op comms-free floor (perf only — garbage
     output). The caller (vLLM) stays backend-agnostic and passes nothing; the
     backend is then resolved from ``AITER_COMMS_BACKEND``. There is
@@ -439,7 +571,7 @@ def make_communicator(
     if backend is None:
         raise ValueError(
             "AITER_COMMS_BACKEND is not set; specify the communicator backend "
-            "explicitly ('iris', 'torch', or 'dummy')"
+            "explicitly ('iris', 'hip', 'torch', or 'dummy')"
         )
     backend = backend.lower()
     logger.info("aiter make_communicator: backend=%s", backend)
@@ -449,4 +581,6 @@ def make_communicator(
         return TorchCommunicator(cpu_group, device_group, device, max_size)
     if backend == "dummy":
         return DummyCommunicator(cpu_group, device_group, device, max_size)
+    if backend == "hip":
+        return HipCommunicator(cpu_group, device_group, device, max_size)
     raise ValueError(f"unknown communicator backend {backend!r}")

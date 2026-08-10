@@ -38,7 +38,13 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
 )
 from aiter.dist.utils import get_distributed_init_method, get_open_port
-from aiter.ops.triton.comms.communicator import make_communicator
+from aiter.ops.triton.comms.communicator import (
+    DummyCommunicator,
+    HipCommunicator,
+    IrisCommunicator,
+    TorchCommunicator,
+    make_communicator,
+)
 from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
@@ -71,11 +77,69 @@ OPS = ["all_reduce", "all_gather"]
 # _build_communicator checks `.disabled` here.
 
 
+# What each backend name MUST construct. Stated here independently of the factory's
+# if-chain on purpose: if the two ever disagree, one of them is wrong and this is what
+# says so. A factory branch wired to the wrong class is silent -- you ask for iris, get
+# something else, and the run produces a plausible number for the wrong thing.
+_BACKEND_CLASS = {
+    "iris": IrisCommunicator,
+    "hip": HipCommunicator,
+    "torch": TorchCommunicator,
+    "dummy": DummyCommunicator,
+}
+
+
 def _build_communicator(backend, cpu_group, device_group, device):
     comm = make_communicator(cpu_group, device_group, device, backend=backend)
+    # Every test funnels through here, so this one assertion covers the mapping at every
+    # world size, dtype, shape and op the suite runs -- there is no separate test to
+    # remember to extend when a backend is added.
+    expected = _BACKEND_CLASS.get(backend)
+    if expected is None:
+        raise RuntimeError(f"test does not know what backend {backend!r} should build")
+    if type(comm) is not expected:
+        raise RuntimeError(
+            f"asked for backend {backend!r} and got {type(comm).__name__}, "
+            f"expected {expected.__name__} -- the factory is wired to the wrong class"
+        )
     if comm.disabled:
         raise RuntimeError(f"{backend} communicator disabled")
     return comm
+
+
+def check_backend_selection():
+    """The selector's contract, with no GPU and no process group: every known name maps
+    to its own class, an unknown name RAISES, and there is no default.
+
+    Cheap and first, because the failure it catches is the expensive kind -- a silently
+    wrong backend does not crash, it returns numbers for something you did not ask for.
+    """
+    for name, cls in _BACKEND_CLASS.items():
+        assert name in _BACKEND_CLASS and cls is not None
+    # distinct classes: a copy-paste in the factory that points two names at one impl
+    # would make two "different" arms the same measurement.
+    assert len(set(_BACKEND_CLASS.values())) == len(_BACKEND_CLASS)
+
+    for bad in ("hpi", "Iris ", "", "nccl"):
+        try:
+            make_communicator(None, None, 0, backend=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"backend {bad!r} was accepted; it must raise")
+
+    saved = os.environ.pop("AITER_COMMS_BACKEND", None)
+    try:
+        make_communicator(None, None, 0, backend=None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unset backend must raise, never pick a default")
+    finally:
+        if saved is not None:
+            os.environ["AITER_COMMS_BACKEND"] = saved
+
+    logging.info("backend selection OK: %s", ", ".join(sorted(_BACKEND_CLASS)))
 
 
 def _make_op(comm, op_name, x):
@@ -290,7 +354,9 @@ def run_comm_vary(
         out = op()
 
     # Back-to-back replays: fresh input in, snapshot out, no inter-replay sync.
-    out_buf = torch.empty((NUM_VARY_REPLAYS, *out.shape), dtype=out.dtype, device=device)
+    out_buf = torch.empty(
+        (NUM_VARY_REPLAYS, *out.shape), dtype=out.dtype, device=device
+    )
     for k in range(NUM_VARY_REPLAYS):
         static_in.copy_(my_inputs[k])
         graph.replay()
@@ -309,7 +375,9 @@ def run_comm_vary(
     worst_diff = 0.0
     worst_k = -1
     for k in range(NUM_VARY_REPLAYS):
-        ref_k = reference(op_name, [all_inputs[r][k] for r in range(tp_size)]).to(torch.float32)
+        ref_k = reference(op_name, [all_inputs[r][k] for r in range(tp_size)]).to(
+            torch.float32
+        )
         got = out_buf[k].to(torch.float32)
         d = (got - ref_k).abs().max().item()
         if d > worst_diff:
@@ -345,7 +413,16 @@ def test_communicator_vary(
     rets = [
         pool.apply_async(
             run_comm_vary,
-            args=(tp_size, pp_size, i, shape, dtype, op_name, backend, distributed_init_method),
+            args=(
+                tp_size,
+                pp_size,
+                i,
+                shape,
+                dtype,
+                op_name,
+                backend,
+                distributed_init_method,
+            ),
         )
         for i in range(tp_size)
     ]
@@ -391,6 +468,8 @@ parser.add_argument(
 if __name__ == "__main__":
     freeze_support()
     args = parser.parse_args()
+    # Before any GPU work: prove the selector returns what it is asked for.
+    check_backend_selection()
     if args.dtype is None:
         l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
     else:
@@ -430,7 +509,9 @@ if __name__ == "__main__":
     # and iris fails, the harness is fair and the bug is iris's, not the test's.
     ctrl_dtype = dtypes.d_dtypes["fp16"]
     ctrl_shape = (4, 8192)
-    ok, wd, wk, atol = test_communicator_vary(8, 1, ctrl_shape, ctrl_dtype, "all_reduce", "torch", _init())
+    ok, wd, wk, atol = test_communicator_vary(
+        8, 1, ctrl_shape, ctrl_dtype, "all_reduce", "torch", _init()
+    )
     summary.append(("torch", "all_reduce", ctrl_dtype, ctrl_shape, ok, wd, wk, atol))
 
     # The communicator under test, full matrix. Collect (no exit-on-first) so the
@@ -438,7 +519,9 @@ if __name__ == "__main__":
     for op_name in OPS:
         for dtype in l_dtype:
             for shape in l_shape:
-                ok, wd, wk, atol = test_communicator_vary(8, 1, shape, dtype, op_name, "iris", _init())
+                ok, wd, wk, atol = test_communicator_vary(
+                    8, 1, shape, dtype, op_name, "iris", _init()
+                )
                 summary.append(("iris", op_name, dtype, shape, ok, wd, wk, atol))
 
     print("\n==== varying-input cudagraph summary ====")
