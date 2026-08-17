@@ -85,10 +85,13 @@ _BACKEND_CLASS = {
     "torch": TorchCommunicator,
 }
 
-# Every backend runs the FULL correctness matrix. torch is first because it is the
-# control: it is known-good, so if it fails the harness is wrong and no other verdict
-# in the run means anything. Subset with `-b`.
-BACKENDS = ("torch", "iris", "hip")
+# Every backend runs the FULL correctness matrix, and the ORDER is deliberate. torch is
+# first because it is the control: known-good, so if it fails the harness is wrong and no
+# other verdict in the run means anything. `hip` is second because it is the one under
+# active development -- the full matrix takes hours, and putting the backend we are
+# iterating on last means waiting most of that before learning anything about it.
+# Subset with `-b`.
+BACKENDS = ("torch", "hip", "iris")
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
@@ -506,12 +509,20 @@ if __name__ == "__main__":
     # replay. Verdicts are COLLECTED, not raised on, so one backend's failure does not
     # hide the rest -- the whole picture lands in one run.
     summary = []  # (phase, backend, op, dtype, shape, ok, worst_diff, worst_k, atol)
+    # Announce each case BEFORE running it. A new barrier is likelier to deadlock than to
+    # answer wrong, and a deadlock with no per-case output leaves you guessing which of 108
+    # cases hung. Flushed, because a hung process never gets to drain a buffer.
+    total = len(backends) * len(OPS) * len(l_dtype) * len(l_shape)
+    done = 0
     for backend in backends:
         for op_name in OPS:
             for dtype in l_dtype:
                 for shape in l_shape:
                     for capture in (False, True):
                         phase = "cudagraph" if capture else "eager"
+                        done += 1
+                        print(f"[case {done}/{total * 2}] {backend} {op_name} {shape} "
+                              f"{dtype} {phase}", flush=True)
                         ok, wd, atol = test_communicator(
                             8,
                             1,
@@ -534,10 +545,14 @@ if __name__ == "__main__":
     def _init():
         return get_distributed_init_method("127.0.0.1", get_open_port())
 
+    vary_done = 0
     for backend in backends:
         for op_name in OPS:
             for dtype in l_dtype:
                 for shape in l_shape:
+                    vary_done += 1
+                    print(f"[vary {vary_done}/{total}] {backend} {op_name} {shape} {dtype}",
+                          flush=True)
                     ok, wd, wk, atol = test_communicator_vary(
                         8, 1, shape, dtype, op_name, backend, _init()
                     )

@@ -129,6 +129,7 @@ class HipComms:
         *,
         scratch_bytes: int = 8 << 20,
         max_buffers: int = 512,
+        max_size: int = 8 << 20,
     ) -> None:
         mod = load()
         self.mod = mod
@@ -146,7 +147,15 @@ class HipComms:
         self._slab = torch.zeros(
             mod.PEER_PTRS_BYTES * max_buffers, dtype=torch.uint8, device=device
         )
+        # A pre-registered buffer for the EAGER path. The kernel reads peer pointers, so an
+        # input has to be registered -- and eagerly the caller hands us whatever the
+        # allocator gave it. Staging into this buffer is the copy the capture path exists
+        # to avoid, and that asymmetry is the point: the copy lives ONLY on the path nobody
+        # measures. vLLM's CustomAllreduce does the same thing for the same reason.
+        self._staging = torch.zeros(max_size, dtype=torch.uint8, device=device)
+        self._registered: set = set()
 
+        self.max_size = max_size
         handles, offsets = self._exchange(self._signal.data_ptr())
         self.comms = mod.Comms(
             rank=self.rank,
@@ -156,6 +165,17 @@ class HipComms:
             signal_offsets=offsets,
             peer_slab=self._slab.data_ptr(),
             peer_slab_bytes=self._slab.numel(),
+        )
+        self.register(self._staging)
+        # Say what will actually be launched, once. Otherwise a run tells you the answer was
+        # wrong but not what was asked for, and "which config produced this" is the first
+        # question every time.
+        cfg = config_for("all_reduce", torch.bfloat16, 0, self.world_size)
+        print(
+            f"[hip_comms] rank {self.rank}/{self.world_size} ready: algo={cfg.algo} "
+            f"blocks={cfg.blocks} threads={cfg.threads} "
+            f"staging={self._staging.numel()}B slots={max_buffers}",
+            flush=True,
         )
 
     def _exchange(self, ptr: int) -> Tuple[List[bytes], List[int]]:
@@ -171,6 +191,7 @@ class HipComms:
         self.comms.register_buffer(
             handles=handles, offsets=offsets, self_ptr=tensor.data_ptr()
         )
+        self._registered.add(tensor.data_ptr())
 
     @contextmanager
     def capture(self) -> Iterator[None]:
@@ -203,6 +224,23 @@ class HipComms:
             handles=[h for h, _ in per_buffer], offsets=[o for _, o in per_buffer]
         )
 
+    def _as_input(self, inp: torch.Tensor) -> torch.Tensor:
+        """The tensor the kernel may read as an input: `inp` when it is registered or we
+        are capturing (registration is deferred then), else a staged copy."""
+        if inp.data_ptr() in self._registered:
+            return inp
+        if torch.cuda.is_current_stream_capturing():
+            return inp
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes > self._staging.numel():
+            raise RuntimeError(
+                f"hip_comms: {nbytes} bytes exceeds the {self._staging.numel()}-byte "
+                f"staging buffer. Register the tensor, or raise max_size."
+            )
+        staged = self._staging[:nbytes].view(inp.dtype).view_as(inp)
+        staged.copy_(inp)
+        return staged
+
     def all_reduce(
         self, out: torch.Tensor, inp: torch.Tensor, cfg: Optional[LaunchConfig] = None
     ) -> None:
@@ -210,7 +248,8 @@ class HipComms:
         if cfg is None:
             cfg = config_for("all_reduce", inp.dtype, inp.numel(), self.world_size)
         self.comms.all_reduce(
-            out=out, inp=inp, algo=cfg.algo, blocks=cfg.blocks, threads=cfg.threads
+            out=out, inp=self._as_input(inp), algo=cfg.algo, blocks=cfg.blocks,
+            threads=cfg.threads,
         )
 
     def all_gather(
@@ -230,7 +269,8 @@ class HipComms:
         shape = tuple(inp.size())
         staged = torch.empty((self.world_size,) + shape, dtype=inp.dtype, device=inp.device)
         self.comms.all_gather(
-            out=staged, inp=inp, algo=cfg.algo, blocks=cfg.blocks, threads=cfg.threads
+            out=staged, inp=self._as_input(inp), algo=cfg.algo, blocks=cfg.blocks,
+            threads=cfg.threads,
         )
         return staged.movedim(0, dim).reshape(
             shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]

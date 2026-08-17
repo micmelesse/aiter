@@ -209,13 +209,17 @@ static Handle handle_from(const std::string& bytes) {
 // tensor within it. Returning both together is what keeps the two from drifting apart.
 static hipPointer_attribute range_start_attr = HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 
-static std::pair<std::string, int64_t> ipc_handle_and_offset(uintptr_t ptr) {
+// py::bytes, NOT std::string: pybind converts std::string to a Python `str` by decoding
+// UTF-8, and an IPC handle is arbitrary binary that will not decode. Returning it as a
+// string throws UnicodeDecodeError on the first call. The INPUT direction is safe as
+// std::string because pybind accepts `bytes` for it.
+static std::pair<py::bytes, int64_t> ipc_handle_and_offset(uintptr_t ptr) {
   void* base = nullptr;
   HIP_CHECK(hipPointerGetAttribute(&base, range_start_attr,
                                    reinterpret_cast<hipDeviceptr_t>(ptr)));
   Handle h;
   HIP_CHECK(hipIpcGetMemHandle(&h, base));
-  return {std::string(reinterpret_cast<const char*>(&h), sizeof(Handle)),
+  return {py::bytes(reinterpret_cast<const char*>(&h), sizeof(Handle)),
           reinterpret_cast<char*>(ptr) - static_cast<char*>(base)};
 }
 
