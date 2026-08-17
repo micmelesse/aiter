@@ -422,7 +422,15 @@ class HipCommunicator(Communicator):
 
         # EAGER, and after the disable checks: compiling inside vLLM's cudagraph capture is
         # not recoverable, and a box that cannot run this backend should not pay a build.
-        hip_comms.load()
+        # The context owns the peer handshake and is built once per group, like
+        # CustomAllreduce; it knows nothing about which collective runs over it.
+        #
+        # NOTE this line is a COLLECTIVE (it all-gathers IPC handles), so every rank must
+        # reach it. The disable checks above are uniform across a TP group in practice --
+        # same arch, same world size -- but if they ever were not, the ranks that got here
+        # would HANG waiting for the ones that returned, rather than failing. Worth
+        # knowing because a deadlock is far worse than an error.
+        self._comms = hip_comms.HipComms(cpu_group, self.device)
         self.disabled = False
         logger.info(
             "HipCommunicator ready: world_size=%d max_size=%dMB",
@@ -461,31 +469,22 @@ class HipCommunicator(Communicator):
         return True
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """The two-stage HIP all-reduce (reduce-scatter then all-gather)."""
+        """Sum `inp` across the TP ranks. The launch config is chosen in `hip_comms`."""
         out = torch.empty_like(inp)
-        hip_comms.all_reduce(out, inp)
+        self._comms.all_reduce(out, inp)
         return out
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        """All-gather along `dim`, rank-ordered."""
-        if dim < 0:
-            dim += inp.dim()
-        input_size = inp.size()
-        out = torch.empty(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :],
-            dtype=inp.dtype,
-            device=inp.device,
-        )
-        hip_comms.all_gather(out, inp.contiguous())
-        return out
+        """Concatenate every rank's `inp` along `dim`, rank-ordered."""
+        return self._comms.all_gather(inp.contiguous(), dim)
 
     @contextmanager
     def capture(self) -> Iterator[None]:
-        # Nothing to register while there is no kernel. The two-stage design will
-        # want its peer buffers registered here, which is why the hook exists now.
-        yield
+        # The whole reason this hook exists: a captured input's address is not registered
+        # when the launch is recorded, so the context reserves a slot during capture and
+        # exchanges the IPC handles for everything recorded on the way out.
+        with self._comms.capture():
+            yield
 
 
 def make_communicator(
