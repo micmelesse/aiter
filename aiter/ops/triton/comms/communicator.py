@@ -437,12 +437,16 @@ class HipCommunicator(Communicator):
     workload -- worth revisiting only if the message shrinks (lower concurrency or
     a smaller hidden dim).
 
-    STATUS: the seam, not the kernel. The class self-disables while the kernel
-    module is absent, exactly as `IrisCommunicator` self-disables without `iris`,
-    so `AITER_COMMS_BACKEND=hip` is already selectable and inert rather than
-    broken. The collectives raise until the kernel lands, which cannot be reached
-    through vLLM because `should_*` gates on `disabled` first -- and a raise is the
-    right behaviour for anything that bypasses the gate.
+    STATUS: the seam is LIVE, the kernel is pending. Without the kernel module the
+    collectives run through torch -- correct values at torch speed -- so the backend
+    is selectable, enabled, and exercised end to end while only the kernel remains
+    to be written. It self-disables for the same reasons `IrisCommunicator` does
+    (unsupported arch, unsupported world size), but NOT for a missing kernel.
+
+    A placeholder that produces right answers is safe to run and dangerous to
+    MEASURE, so it says so loudly at init, and `AITER_COMMS_REQUIRE_KERNEL=1` turns
+    the fallback into a refusal for any run whose numbers are meant to mean
+    something.
     """
 
     # Matches IrisCommunicator: a two-stage reduce-scatter needs the element count
@@ -471,12 +475,27 @@ class HipCommunicator(Communicator):
         self.max_size = max_size
         self.world_size = dist.get_world_size(device_group)
 
-        if not _hip_comms_available():
-            logger.info(
-                "aiter HipCommunicator disabled: %s is not importable",
+        # A missing kernel selects the PLACEHOLDER; it does not disable the backend. Enabled is the
+        # point: everything around the kernel -- the vLLM dispatch, the arm, the harness, the report
+        # -- has to be exercised before the kernel exists, or the day the kernel lands is the day we
+        # start debugging the plumbing instead of the kernel.
+        self._kernel = _hip_comms_available()
+        if not self._kernel:
+            if os.environ.get("AITER_COMMS_REQUIRE_KERNEL") == "1":
+                # For a run whose NUMBERS matter: refuse rather than quietly measure the placeholder.
+                # A backend that silently substitutes something slower is a false READY -- the run
+                # produces output and the output is about the wrong thing.
+                raise RuntimeError(
+                    f"AITER_COMMS_BACKEND=hip with AITER_COMMS_REQUIRE_KERNEL=1, but "
+                    f"{_HIP_COMMS_MODULE} is not importable, so the HIP kernel is absent. Refusing "
+                    f"to fall back: unset the variable to measure the placeholder deliberately."
+                )
+            logger.warning(
+                "aiter HipCommunicator: PLACEHOLDER -- %s is not importable, so collectives run "
+                "through torch (correct results, torch speed). Any timing from this arm is NOT the "
+                "HIP kernel. Set AITER_COMMS_REQUIRE_KERNEL=1 to make this a refusal.",
                 _HIP_COMMS_MODULE,
             )
-            return
         if not _rocm_arch_available():
             logger.info("aiter HipCommunicator disabled: unsupported ROCm arch")
             return
@@ -520,15 +539,44 @@ class HipCommunicator(Communicator):
         return True
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """The two-stage HIP all-reduce. Placeholder body until the kernel lands.
+
+        The placeholder is CORRECT and slow rather than fast and wrong: `dist.all_reduce` gives the
+        same values the kernel must give, so everything downstream -- vLLM's dispatch, the arm's
+        output, eval accuracy, the report -- is exercised for real, and the only thing left to build
+        is the kernel. Returning zeros would have made every number garbage and a plumbing bug
+        indistinguishable from the stub.
+
+        THE ONE LINE TO REPLACE: swap the `dist.all_reduce` below for the kernel call. Everything
+        else about this backend is already what it will be."""
+        if not self._kernel:
+            out = inp.clone()
+            dist.all_reduce(out, group=self.device_group)  # SUM
+            return out
         raise NotImplementedError(
-            "HipCommunicator.all_reduce: the HIP kernel is not implemented yet. "
-            "This is unreachable through vLLM (should_allreduce gates on disabled), "
-            "so reaching it means the gate was bypassed."
+            f"{_HIP_COMMS_MODULE} is importable but HipCommunicator.all_reduce does not call it "
+            f"yet -- wire the two-stage kernel here."
         )
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """All-gather. Placeholder body until the kernel lands; see `all_reduce`."""
+        if not self._kernel:
+            if dim < 0:
+                dim += inp.dim()
+            input_size = inp.size()
+            out = torch.empty(
+                (self.world_size,) + tuple(input_size),
+                dtype=inp.dtype,
+                device=inp.device,
+            )
+            dist.all_gather_into_tensor(out, inp.contiguous(), group=self.device_group)
+            return out.movedim(0, dim).reshape(
+                input_size[:dim]
+                + (self.world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
         raise NotImplementedError(
-            "HipCommunicator.all_gather: the HIP kernel is not implemented yet."
+            f"{_HIP_COMMS_MODULE} is importable but HipCommunicator.all_gather does not call it yet."
         )
 
     @contextmanager
