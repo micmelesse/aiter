@@ -39,7 +39,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_open_port
 from aiter.ops.triton.comms.communicator import (
-    DummyCommunicator,
     HipCommunicator,
     IrisCommunicator,
     TorchCommunicator,
@@ -67,9 +66,9 @@ _VARY_SEED = 20260615
 OPS = ["all_reduce", "all_gather"]
 
 
-# ── Communicator: one interface, two impls, one branching point ──
-# The interface (Communicator ABC), both impls — IrisCommunicator (the impl under
-# test) and TorchCommunicator (the known-good control) — and the make_communicator
+# ── Communicator: one interface, three impls, one branching point ──
+# The interface (Communicator ABC), all three impls -- IrisCommunicator, HipCommunicator
+# (ours) and TorchCommunicator (the known-good control) -- and the make_communicator
 # selector all live in aiter's communicator.py, which is exactly what the serving
 # path runs. This test drives that selector directly: "iris" is the impl under
 # test, "torch" is the control, same surface and output contract for both.
@@ -85,8 +84,14 @@ _BACKEND_CLASS = {
     "iris": IrisCommunicator,
     "hip": HipCommunicator,
     "torch": TorchCommunicator,
-    "dummy": DummyCommunicator,
 }
+
+# COVERAGE, stated because the gap is invisible otherwise: below the GPU line only
+# `iris` runs the full matrix, and `torch` runs one all_reduce case as the harness
+# control. `hip` reaches ONLY check_backend_selection (which needs no GPU), so its
+# kernel, launch and capture behaviour are untested here. It cannot join the allclose
+# runs while its kernel is a zero-writing stub -- the case it needs first is a
+# launch/shape/capture check that asserts no values.
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
