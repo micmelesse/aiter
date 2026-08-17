@@ -11,22 +11,12 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from . import hip_comms
+
 logger = logging.getLogger(__name__)
 
 # Match CustomAllreduce default (8 MB).
 _DEFAULT_MAX_SIZE = 8 * 1024 * 1024
-
-
-# The module the HIP backend's kernel comes from. Named ONCE: aiter's csrc carries no comms at all
-# (it is GEMM/CK), so the kernel ships as its own extension the way iris does, and only this constant
-# changes if that home changes.
-_HIP_COMMS_MODULE = "aiter_hip_comms"
-
-
-def _hip_comms_available() -> bool:
-    import importlib.util
-
-    return importlib.util.find_spec(_HIP_COMMS_MODULE) is not None
 
 
 def _iris_available() -> bool:
@@ -58,10 +48,11 @@ class Communicator(ABC):
     """Interface for a TP all-reduce / all-gather backend behind vLLM's
     CudaCommunicator.
 
-    Two implementations select at one factory (make_communicator):
-    IrisCommunicator (production — iris gluon GPU-initiated CCL) and
+    Four implementations select at one factory (make_communicator): IrisCommunicator
+    (iris gluon GPU-initiated CCL), HipCommunicator (our own HIP kernel),
     TorchCommunicator (a torch.distributed reference, the known-good control the
-    iris path is measured and checked against). The surface mirrors what
+    others are measured and checked against) and DummyCommunicator (the comms-free
+    floor, perf only). The surface mirrors what
     CudaCommunicator calls: a ``disabled`` flag, the should_*/all_* pairs
     (collectives are out-of-place — input untouched, new tensor returned), and a
     capture() context entered around cudagraph capture.
@@ -420,7 +411,7 @@ class DummyCommunicator(Communicator):
 
 
 class HipCommunicator(Communicator):
-    """Communicator backed by a HIP all-reduce kernel we own.
+    """Communicator backed by HIP collectives we own (`hip_comms.cu` in this directory).
 
     The point of this backend is CONTROL, not (yet) speed. The iris backend's
     performance depends on someone else's kernel schedule; this one is ours, so it
@@ -437,16 +428,20 @@ class HipCommunicator(Communicator):
     workload -- worth revisiting only if the message shrinks (lower concurrency or
     a smaller hidden dim).
 
-    STATUS: the seam is LIVE, the kernel is pending. Without the kernel module the
-    collectives run through torch -- correct values at torch speed -- so the backend
-    is selectable, enabled, and exercised end to end while only the kernel remains
-    to be written. It self-disables for the same reasons `IrisCommunicator` does
-    (unsupported arch, unsupported world size), but NOT for a missing kernel.
+    STATUS: the seam is LIVE and the kernel is a STUB that writes zeros
+    (`hip_comms.cu`, ours, in this directory). Nothing here routes through torch:
+    the point of the stub is to prove the build and launch path -- hipcc, the pybind
+    symbol, the op load, the launch, the profile entry -- before the algorithm exists.
 
-    A placeholder that produces right answers is safe to run and dangerous to
-    MEASURE, so it says so loudly at init, and `AITER_COMMS_REQUIRE_KERNEL=1` turns
-    the fallback into a refusal for any run whose numbers are meant to mean
-    something.
+    So this arm's OUTPUT is garbage by construction, which is the guard: a stub that
+    returned right answers would be safe to run and dangerous to measure, and would
+    need an env var to stop someone reading its timing as an all-reduce number. Wrong
+    output needs no such flag. Its bench number is a comms-free floor plus one launch.
+
+    It self-disables for the same reasons `IrisCommunicator` does (unsupported arch,
+    unsupported world size). A failed COMPILE is not one of them and raises: a missing
+    iris is genuine unavailability, but our own source failing to build would leave
+    vLLM falling back to its own all-reduce and calling the run READY.
     """
 
     # Matches IrisCommunicator: a two-stage reduce-scatter needs the element count
@@ -475,27 +470,6 @@ class HipCommunicator(Communicator):
         self.max_size = max_size
         self.world_size = dist.get_world_size(device_group)
 
-        # A missing kernel selects the PLACEHOLDER; it does not disable the backend. Enabled is the
-        # point: everything around the kernel -- the vLLM dispatch, the arm, the harness, the report
-        # -- has to be exercised before the kernel exists, or the day the kernel lands is the day we
-        # start debugging the plumbing instead of the kernel.
-        self._kernel = _hip_comms_available()
-        if not self._kernel:
-            if os.environ.get("AITER_COMMS_REQUIRE_KERNEL") == "1":
-                # For a run whose NUMBERS matter: refuse rather than quietly measure the placeholder.
-                # A backend that silently substitutes something slower is a false READY -- the run
-                # produces output and the output is about the wrong thing.
-                raise RuntimeError(
-                    f"AITER_COMMS_BACKEND=hip with AITER_COMMS_REQUIRE_KERNEL=1, but "
-                    f"{_HIP_COMMS_MODULE} is not importable, so the HIP kernel is absent. Refusing "
-                    f"to fall back: unset the variable to measure the placeholder deliberately."
-                )
-            logger.warning(
-                "aiter HipCommunicator: PLACEHOLDER -- %s is not importable, so collectives run "
-                "through torch (correct results, torch speed). Any timing from this arm is NOT the "
-                "HIP kernel. Set AITER_COMMS_REQUIRE_KERNEL=1 to make this a refusal.",
-                _HIP_COMMS_MODULE,
-            )
         if not _rocm_arch_available():
             logger.info("aiter HipCommunicator disabled: unsupported ROCm arch")
             return
@@ -506,6 +480,15 @@ class HipCommunicator(Communicator):
                 self._SUPPORTED_WORLD_SIZES,
             )
             return
+
+        # EAGER, and after the disable checks: compiling inside vLLM's cudagraph capture is
+        # not recoverable, and a box that cannot run this backend should not pay a build.
+        hip_comms.load()
+        if hip_comms.is_stub():
+            logger.warning(
+                "aiter HipCommunicator: the kernel is a STUB that writes ZEROS. This arm's "
+                "output is garbage and its timing is a comms-free floor, NOT an all-reduce."
+            )
         self.disabled = False
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
@@ -539,45 +522,25 @@ class HipCommunicator(Communicator):
         return True
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """The two-stage HIP all-reduce. Placeholder body until the kernel lands.
-
-        The placeholder is CORRECT and slow rather than fast and wrong: `dist.all_reduce` gives the
-        same values the kernel must give, so everything downstream -- vLLM's dispatch, the arm's
-        output, eval accuracy, the report -- is exercised for real, and the only thing left to build
-        is the kernel. Returning zeros would have made every number garbage and a plumbing bug
-        indistinguishable from the stub.
-
-        THE ONE LINE TO REPLACE: swap the `dist.all_reduce` below for the kernel call. Everything
-        else about this backend is already what it will be."""
-        if not self._kernel:
-            out = inp.clone()
-            dist.all_reduce(out, group=self.device_group)  # SUM
-            return out
-        raise NotImplementedError(
-            f"{_HIP_COMMS_MODULE} is importable but HipCommunicator.all_reduce does not call it "
-            f"yet -- wire the two-stage kernel here."
-        )
+        """The two-stage HIP all-reduce. v1 kernel writes zeros; see the class docstring."""
+        out = torch.empty_like(inp)
+        hip_comms.all_reduce(out, inp)
+        return out
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        """All-gather. Placeholder body until the kernel lands; see `all_reduce`."""
-        if not self._kernel:
-            if dim < 0:
-                dim += inp.dim()
-            input_size = inp.size()
-            out = torch.empty(
-                (self.world_size,) + tuple(input_size),
-                dtype=inp.dtype,
-                device=inp.device,
-            )
-            dist.all_gather_into_tensor(out, inp.contiguous(), group=self.device_group)
-            return out.movedim(0, dim).reshape(
-                input_size[:dim]
-                + (self.world_size * input_size[dim],)
-                + input_size[dim + 1 :]
-            )
-        raise NotImplementedError(
-            f"{_HIP_COMMS_MODULE} is importable but HipCommunicator.all_gather does not call it yet."
+        """All-gather. v1 kernel writes zeros; see the class docstring."""
+        if dim < 0:
+            dim += inp.dim()
+        input_size = inp.size()
+        out = torch.empty(
+            input_size[:dim]
+            + (self.world_size * input_size[dim],)
+            + input_size[dim + 1 :],
+            dtype=inp.dtype,
+            device=inp.device,
         )
+        hip_comms.all_gather(out, inp.contiguous())
+        return out
 
     @contextmanager
     def capture(self) -> Iterator[None]:
