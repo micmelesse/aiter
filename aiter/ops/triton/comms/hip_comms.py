@@ -53,16 +53,11 @@ def load() -> Any:
         return _module
 
 
-def is_stub() -> bool:
-    """True while the kernel writes zeros instead of reducing."""
-    return bool(getattr(load(), "IS_STUB", False))
-
-
 def all_reduce(out: torch.Tensor, inp: torch.Tensor) -> None:
-    """Reduce `inp` across ranks into `out`, in place. v1 writes zeros."""
+    """Sum `inp` across every rank into `out`, in place."""
     load().all_reduce(out, inp)
 
 
 def all_gather(out: torch.Tensor, inp: torch.Tensor) -> None:
-    """Gather `inp` from every rank into `out`, in place. v1 writes zeros."""
+    """Concatenate every rank's `inp` into `out`, rank-ordered, in place."""
     load().all_gather(out, inp)

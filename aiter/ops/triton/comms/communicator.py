@@ -373,15 +373,9 @@ class HipCommunicator(Communicator):
     workload -- worth revisiting only if the message shrinks (lower concurrency or
     a smaller hidden dim).
 
-    STATUS: the seam is LIVE and the kernel is a STUB that writes zeros
-    (`hip_comms.cu`, ours, in this directory). Nothing here routes through torch:
-    the point of the stub is to prove the build and launch path -- hipcc, the pybind
-    symbol, the op load, the launch, the profile entry -- before the algorithm exists.
-
-    So this arm's OUTPUT is garbage by construction, which is the guard: a stub that
-    returned right answers would be safe to run and dangerous to measure, and would
-    need an env var to stop someone reading its timing as an all-reduce number. Wrong
-    output needs no such flag. Its bench number is a comms-free floor plus one launch.
+    The kernel is `hip_comms.cu` beside this file, compiled by `hip_comms.py`. It
+    depends on torch and the HIP runtime only -- nothing from aiter's `csrc`, which is
+    not ours -- so the whole path from Python down to the launch is code we control.
 
     It self-disables for the same reasons `IrisCommunicator` does (unsupported arch,
     unsupported world size). A failed COMPILE is not one of them and raises: a missing
@@ -429,12 +423,12 @@ class HipCommunicator(Communicator):
         # EAGER, and after the disable checks: compiling inside vLLM's cudagraph capture is
         # not recoverable, and a box that cannot run this backend should not pay a build.
         hip_comms.load()
-        if hip_comms.is_stub():
-            logger.warning(
-                "aiter HipCommunicator: the kernel is a STUB that writes ZEROS. This arm's "
-                "output is garbage and its timing is a comms-free floor, NOT an all-reduce."
-            )
         self.disabled = False
+        logger.info(
+            "HipCommunicator ready: world_size=%d max_size=%dMB",
+            self.world_size,
+            self.max_size >> 20,
+        )
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         # The SAME admission rules as IrisCommunicator, deliberately: two backends
@@ -467,13 +461,13 @@ class HipCommunicator(Communicator):
         return True
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """The two-stage HIP all-reduce. v1 kernel writes zeros; see the class docstring."""
+        """The two-stage HIP all-reduce (reduce-scatter then all-gather)."""
         out = torch.empty_like(inp)
         hip_comms.all_reduce(out, inp)
         return out
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        """All-gather. v1 kernel writes zeros; see the class docstring."""
+        """All-gather along `dim`, rank-ordered."""
         if dim < 0:
             dim += inp.dim()
         input_size = inp.size()

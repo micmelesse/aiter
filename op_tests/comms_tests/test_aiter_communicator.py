@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness of IrisCommunicator's collective ops — all_reduce and all_gather
-— in eager mode, under cudagraph capture + replay, AND under capture + replay
-with the input changing every replay.
+"""Correctness of EVERY communicator backend's collective ops (all_reduce and
+all_gather) in eager mode, under cudagraph capture + replay, AND under capture +
+replay with the input changing every replay.
 
-One question: does the iris-backed communicator produce correct results? Eager
+One question per backend: does it produce correct results? Eager
 alone is not enough — the gluon kernels elide barriers under graph capture, and a
 race there only shows across a sequence of replays (vLLM captures the decode step
 once and replays it every token).
@@ -44,7 +44,6 @@ from aiter.ops.triton.comms.communicator import (
     TorchCommunicator,
     make_communicator,
 )
-from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
 
@@ -70,8 +69,8 @@ OPS = ["all_reduce", "all_gather"]
 # The interface (Communicator ABC), all three impls -- IrisCommunicator, HipCommunicator
 # (ours) and TorchCommunicator (the known-good control) -- and the make_communicator
 # selector all live in aiter's communicator.py, which is exactly what the serving
-# path runs. This test drives that selector directly: "iris" is the impl under
-# test, "torch" is the control, same surface and output contract for both.
+# path runs. This test drives that selector directly: every backend runs the same
+# matrix, and "torch" is the control because it is the known-good one.
 # make_communicator returns the communicator without raising on unavailability, so
 # _build_communicator checks `.disabled` here.
 
@@ -86,12 +85,10 @@ _BACKEND_CLASS = {
     "torch": TorchCommunicator,
 }
 
-# COVERAGE, stated because the gap is invisible otherwise: below the GPU line only
-# `iris` runs the full matrix, and `torch` runs one all_reduce case as the harness
-# control. `hip` reaches ONLY check_backend_selection (which needs no GPU), so its
-# kernel, launch and capture behaviour are untested here. It cannot join the allclose
-# runs while its kernel is a zero-writing stub -- the case it needs first is a
-# launch/shape/capture check that asserts no values.
+# Every backend runs the FULL correctness matrix. torch is first because it is the
+# control: it is known-good, so if it fails the harness is wrong and no other verdict
+# in the run means anything. Subset with `-b`.
+BACKENDS = ("torch", "iris", "hip")
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
@@ -153,13 +150,15 @@ def _make_op(comm, op_name, x):
     if op_name == "all_reduce":
         if not comm.should_allreduce(x):
             raise RuntimeError(
-                f"IrisCommunicator rejected all_reduce: shape={tuple(x.shape)} dtype={x.dtype}"
+                f"{type(comm).__name__} rejected all_reduce: "
+                f"shape={tuple(x.shape)} dtype={x.dtype}"
             )
         return lambda: comm.all_reduce(x)
     if op_name == "all_gather":
         if not comm.should_allgather(x):
             raise RuntimeError(
-                f"IrisCommunicator rejected all_gather: shape={tuple(x.shape)} dtype={x.dtype}"
+                f"{type(comm).__name__} rejected all_gather: "
+                f"shape={tuple(x.shape)} dtype={x.dtype}"
             )
         return lambda: comm.all_gather(x)
     raise ValueError(f"unknown op {op_name!r}")
@@ -172,7 +171,7 @@ def run_comm(
     x,
     op_name,
     capture,
-    backend="iris",
+    backend,
     distributed_init_method: Optional[str] = None,
 ):
     """One rank: init distributed, build the `backend` communicator, run `op_name`
@@ -224,7 +223,7 @@ def reference(op_name, inputs, dim=-1):
     """What every rank should hold afterwards. all_reduce = elementwise sum
     (accumulated in fp32 so the reference itself doesn't eat bf16 rounding);
     all_gather = concat of the per-rank inputs along `dim`, rank-ordered (the
-    IrisCommunicator.all_gather contract)."""
+    Communicator.all_gather contract, same for every backend)."""
     if op_name == "all_reduce":
         acc = torch.zeros_like(inputs[0], dtype=torch.float32)
         for x in inputs:
@@ -253,9 +252,11 @@ def test_communicator(
     dtype,
     op_name,
     capture,
-    backend="iris",
+    backend,
     distributed_init_method: Optional[str] = None,
 ):
+    """Driver for one identical-input case, eager or cudagraph-captured.
+    Returns (ok, worst_diff, atol)."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     inputs = [torch.randn(shape, dtype=dtype) for _ in range(tp_size)]
@@ -280,11 +281,20 @@ def test_communicator(
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
-    mode = "cudagraph" if capture else "eager"
+    # Return a verdict rather than raising, for the same reason the varying-input
+    # driver does: the caller runs EVERY backend before deciding, so one backend's
+    # failure must not abort the others. Same allclose semantics as that path.
     atol = tolerance(op_name, dtype)
+    rtol = 0.01
+    ref32 = ref.to(torch.float32)
+    ok = True
+    worst_diff = 0.0
     for out in rets:
-        msg = f"IrisCommunicator.{op_name} [{mode}]: {shape=} {dtype=}"
-        checkAllclose(ref, out.to(ref), atol=atol, rtol=0.01, msg=msg)
+        got = out.to(ref).to(torch.float32)
+        worst_diff = max(worst_diff, (got - ref32).abs().max().item())
+        if not torch.allclose(got, ref32, atol=atol, rtol=rtol):
+            ok = False
+    return ok, worst_diff, atol
 
 
 def _vary_input(rank, k, shape, dtype):
@@ -307,11 +317,11 @@ def run_comm_vary(
     shape,
     dtype,
     op_name,
-    backend="iris",
+    backend,
     distributed_init_method: Optional[str] = None,
 ):
-    """One rank of the varying-input cudagraph check, for `backend` ('iris' = the
-    IrisCommunicator under test; 'torch' = the known-good control).
+    """One rank of the varying-input cudagraph check, for `backend` (any of BACKENDS;
+    'torch' is the known-good control).
 
     Captures the op once, then replays NUM_VARY_REPLAYS times, copying a DIFFERENT
     input into the static capture buffer before each replay — exactly how vLLM
@@ -468,6 +478,14 @@ parser.add_argument(
     default=None,
     help="shape. e.g. -s 128,8192",
 )
+parser.add_argument(
+    "-b",
+    "--backend",
+    type=str,
+    choices=list(BACKENDS),
+    default=None,
+    help="run only this backend (default: all of them)",
+)
 
 
 if __name__ == "__main__":
@@ -481,77 +499,78 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
-    # Every collective the communicator offers, eager then cudagraph capture +
-    # replay (identical input). No modes to pick — run it; the checkAllclose
-    # lines are the answer.
-    for op_name in OPS:
-        for dtype in l_dtype:
-            for shape in l_shape:
-                for capture in (False, True):
-                    test_communicator(
-                        8,
-                        1,
-                        shape,
-                        dtype,
-                        op_name,
-                        capture,
-                        distributed_init_method=get_distributed_init_method(
-                            "127.0.0.1", get_open_port()
-                        ),
-                    )
+    backends = [args.backend] if args.backend else list(BACKENDS)
+    print(f"backends: {backends}")
+
+    # Every backend, every collective, identical-input eager then cudagraph capture +
+    # replay. Verdicts are COLLECTED, not raised on, so one backend's failure does not
+    # hide the rest -- the whole picture lands in one run.
+    summary = []  # (phase, backend, op, dtype, shape, ok, worst_diff, worst_k, atol)
+    for backend in backends:
+        for op_name in OPS:
+            for dtype in l_dtype:
+                for shape in l_shape:
+                    for capture in (False, True):
+                        phase = "cudagraph" if capture else "eager"
+                        ok, wd, atol = test_communicator(
+                            8,
+                            1,
+                            shape,
+                            dtype,
+                            op_name,
+                            capture,
+                            backend,
+                            distributed_init_method=get_distributed_init_method(
+                                "127.0.0.1", get_open_port()
+                            ),
+                        )
+                        summary.append(
+                            (phase, backend, op_name, dtype, shape, ok, wd, -1, atol)
+                        )
 
     # Then the varying-input cudagraph check — fresh input per replay, each
     # checked against its own reference. This is the one that catches a
     # dropped/stale symmetric-heap read (which identical-input replays hide).
-    summary = []  # (backend, op, dtype, shape, ok, worst_diff, worst_k, atol)
-
     def _init():
         return get_distributed_init_method("127.0.0.1", get_open_port())
 
-    # CONTROL FIRST: the known-good torch.distributed path through the SAME
-    # harness, on a case the iris path fails. The harness code is shared across
-    # ops, so validating it on all_reduce covers all_gather too. If this passes
-    # and iris fails, the harness is fair and the bug is iris's, not the test's.
-    ctrl_dtype = dtypes.d_dtypes["fp16"]
-    ctrl_shape = (4, 8192)
-    ok, wd, wk, atol = test_communicator_vary(
-        8, 1, ctrl_shape, ctrl_dtype, "all_reduce", "torch", _init()
-    )
-    summary.append(("torch", "all_reduce", ctrl_dtype, ctrl_shape, ok, wd, wk, atol))
+    for backend in backends:
+        for op_name in OPS:
+            for dtype in l_dtype:
+                for shape in l_shape:
+                    ok, wd, wk, atol = test_communicator_vary(
+                        8, 1, shape, dtype, op_name, backend, _init()
+                    )
+                    summary.append(
+                        ("vary", backend, op_name, dtype, shape, ok, wd, wk, atol)
+                    )
 
-    # The communicator under test, full matrix. Collect (no exit-on-first) so the
-    # whole picture — which ops/dtypes/shapes fail — lands in one run.
-    for op_name in OPS:
-        for dtype in l_dtype:
-            for shape in l_shape:
-                ok, wd, wk, atol = test_communicator_vary(
-                    8, 1, shape, dtype, op_name, "iris", _init()
-                )
-                summary.append(("iris", op_name, dtype, shape, ok, wd, wk, atol))
-
-    print("\n==== varying-input cudagraph summary ====")
-    for backend, op_name, dt, sh, ok, wd, wk, atol in summary:
+    print("\n==== correctness summary ====")
+    for phase, backend, op_name, dt, sh, ok, wd, wk, atol in summary:
         print(
-            f"  [{backend:5}] {op_name:11} {str(sh):12} {str(dt):16} "
+            f"  [{backend:5}] {phase:9} {op_name:11} {str(sh):12} {str(dt):16} "
             f"{'OK  ' if ok else 'FAIL'} worst|diff|={wd:.3g} atol={atol} @replay {wk}"
         )
 
-    # Verdict. Control failing means the harness itself is unsound — the iris
-    # result can't be trusted, so that's a distinct, louder error than an iris bug.
-    control_fail = [s for s in summary if s[0] == "torch" and not s[4]]
+    # CONTROL FIRST. torch.distributed is known-good, so it failing means the HARNESS is
+    # wrong and every other verdict in the table is worthless -- a distinct, louder error
+    # than a backend bug.
+    control_fail = [s for s in summary if s[1] == "torch" and not s[5]]
     assert not control_fail, (
         "CONTROL FAILED: torch.distributed (known-good) is wrong under this harness "
-        f"({control_fail[0][5]:.3g} > atol {control_fail[0][7]}). The harness is unsound; "
-        "the iris result below cannot be trusted until this is fixed."
+        f"({control_fail[0][6]:.3g} > atol {control_fail[0][8]}). The harness is unsound; "
+        "no other result in the table can be trusted until this is fixed."
     )
-    iris_fail = [s for s in summary if s[0] == "iris" and not s[4]]
-    if iris_fail:
+
+    # Then the backends under test. Control passed, so these are real bugs.
+    failed = [s for s in summary if not s[5]]
+    if failed:
         raise AssertionError(
-            "iris collectives are WRONG under varying-input cudagraph replay "
-            "(control passed, so this is a real iris bug, not a test artifact): "
+            "collectives are WRONG (control passed, so these are real backend bugs, "
+            "not test artifacts): "
             + "; ".join(
-                f"{op} {sh} {dt} worst|diff|={wd:.3g}>{atol} @replay {wk}"
-                for _, op, dt, sh, _, wd, wk, atol in iris_fail
+                f"{b}/{phase} {op} {sh} {dt} worst|diff|={wd:.3g}>{atol} @replay {wk}"
+                for phase, b, op, dt, sh, _, wd, wk, atol in failed
             )
         )
-    print("all varying-input cases within tolerance")
+    print("all cases within tolerance")
