@@ -53,14 +53,10 @@ logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
-# Replays for the cudagraph correctness check. Back-to-back with no inter-replay
-# sync is what stresses an elided end barrier (replay N+1 must not start before
-# replay N's symmetric-heap writes land); a per-replay sync would hide the race.
-NUM_REPLAYS = 1000
-
-# Replays for the varying-input check. Fewer than NUM_REPLAYS because each replay
-# also keeps a snapshot output buffer (N x out-shape) and a stale read shows
-# within the first few differing replays anyway — no need for 1000.
+# Replays for the cudagraph case. Back-to-back with no inter-replay sync is what stresses an
+# elided end barrier (replay N+1 must not start before replay N's writes land); a per-replay sync
+# would hide the race. 200 rather than more because each replay also keeps a snapshot output buffer
+# (N x out-shape) and a stale read shows within the first few differing replays anyway.
 NUM_VARY_REPLAYS = 200
 
 # Deterministic per-(rank, replay) seed base for the varying-input check.
@@ -108,7 +104,16 @@ BACKENDS = ("torch", "hip", "iris")
 # shrink step would be a full 8-process run, so the sweep is hand-coded (CONTRIBUTING *Shrink and
 # bisect the input axis*). The domain is small and enumerated on purpose.
 
-MODES = ("eager", "cudagraph", "varying")
+# TWO modes, not three. `cudagraph` ALWAYS varies the input across replays, because the
+# identical-input variant could not catch the bug this suite exists for: if replay k+1 reads k's
+# buffer before k's writes land, it gets k's data -- which EQUALS the correct answer when every
+# input is identical, so the test passes while the race is live. vLLM copies a fresh activation in
+# every token, so a stale read there is the previous token's garbage; varying is the faithful mode.
+#
+# Keeping identical-input as a third mode bought exactly one thing -- telling "capture itself is
+# broken" apart from "staleness between replays" -- and `Measurement.worst_at` already gives that:
+# diverging at replay 0 is capture, at replay 1+ is staleness. Same answer, half the matrix.
+MODES = ("eager", "cudagraph")
 
 
 @dataclass(frozen=True)
@@ -130,23 +135,47 @@ class Case:
 
 
 @dataclass(frozen=True)
-class Verdict:
-    """What one case produced. `hung` is its own outcome, not a flavour of failure: a case that
-    never answered tells you something different from one that answered wrongly."""
+class Measurement:
+    """What a case that RAN produced. Pure numbers; no error channel."""
+
+    worst_diff: float
+    worst_at: int               # replay index of the worst divergence; -1 for eager
+    atol: float
+
+    @property
+    def within_tolerance(self) -> bool:
+        return self.worst_diff <= self.atol
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What became of one case: it measured something, or it failed with an exception.
+
+    ONE optional-pair rather than `ok`/`hung`/`error` flags. Those could contradict each other
+    (`ok=True, hung=True` was representable and meaningless) and flattened the exception to a
+    string, losing the traceback. `hung` is not a field at all now -- it is
+    `isinstance(failure, mp.TimeoutError)`, which is where that fact actually lives.
+    """
 
     case: Case
-    ok: bool
-    worst_diff: float = 0.0
-    worst_at: int = -1          # replay index for `varying`; -1 where there is no such thing
-    atol: float = 0.0
-    hung: bool = False
-    error: str = ""
+    measured: Optional[Measurement] = None
+    failure: Optional[BaseException] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.measured is not None and self.measured.within_tolerance
+
+    @property
+    def hung(self) -> bool:
+        return isinstance(self.failure, mp.TimeoutError)
 
     @property
     def label(self) -> str:
         if self.hung:
             return "HUNG"
-        return "OK  " if self.ok else ("ERROR" if self.error else "FAIL")
+        if self.failure is not None:
+            return "ERROR"
+        return "OK" if self.ok else "FAIL"
 
 
 def cases(backends: Sequence[str], ops: Sequence[str], dts: Sequence["torch.dtype"],
@@ -241,13 +270,14 @@ def run_comm(
     rankID,
     x,
     op_name,
-    capture,
     backend,
     distributed_init_method: Optional[str] = None,
 ):
-    """One rank: init distributed, build the `backend` communicator, run `op_name`
-    either eagerly or under cudagraph capture + NUM_REPLAYS back-to-back replays,
-    and return the result for the driver to check against the reference."""
+    """One rank of an EAGER case: init distributed, build the `backend` communicator, call
+    `op_name` once, and return the result for the driver to check against the reference.
+
+    Eager only. Capture lives in `run_comm_vary`, because a captured graph is only worth replaying
+    against a CHANGING input -- replaying an identical one cannot catch a stale read (see MODES)."""
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
 
@@ -273,14 +303,6 @@ def run_comm(
         out = op()
     torch.cuda.synchronize()
 
-    if capture:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = op()
-        for _ in range(NUM_REPLAYS):
-            graph.replay()
-        torch.cuda.synchronize()
-
     result = out.clone()
 
     # FREE THE GRAPH BEFORE TEARING DOWN THE PROCESS GROUP. A captured graph holds references to
@@ -288,8 +310,6 @@ def run_comm(
     # live graph still owns -- every rank then waits inside it forever. Seen 2026-08-18: all 8 ranks
     # stuck in `destroy_process_group` on the `all_gather` capture case, GPUs at 0%, for 8 minutes
     # until it was killed. `out` goes too: it is a graph-pool tensor, so it keeps the pool alive.
-    if capture:
-        del graph
     del out
     torch.cuda.synchronize()
 
@@ -356,11 +376,10 @@ def test_communicator(
     shape,
     dtype,
     op_name,
-    capture,
     backend,
     distributed_init_method: Optional[str] = None,
 ):
-    """Driver for one identical-input case, eager or cudagraph-captured.
+    """Driver for one EAGER case.
     Returns (ok, worst_diff, atol)."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -376,7 +395,6 @@ def test_communicator(
                 i,
                 inputs[i],
                 op_name,
-                capture,
                 backend,
                 distributed_init_method,
             ),
@@ -569,72 +587,67 @@ def test_communicator_vary(
 # magnitude and still catches the failure it exists for. Without it a deadlocked case sits until
 # gk's 4h workload deadline and the run reports nothing at all -- which is what happened on
 # 2026-08-17 (killed at 30min by gloo's own timeout) and again on 2026-08-18 (killed by hand at 8min).
-def run_case(case: Case, world: int = 8, pp: int = 1) -> Verdict:
-    """Run ONE case across `world` ranks and return its verdict. Never raises for a case failure.
+def run_case(case: Case, world: int = 8, pp: int = 1) -> Outcome:
+    """Run ONE case across `world` ranks. THE boundary: the only place a case failure is caught.
 
-    Collects rather than raises so a failing case does not abandon the ones after it: the summary
-    is the deliverable, and one backend's bug must not hide another's. A TIMEOUT is a verdict too --
-    the ranks are terminated and the case is reported HUNG, so the run continues and says which
-    case never answered instead of stalling silently.
+    It catches rather than propagates because a per-case failure must not abandon the cases after
+    it -- the summary is the deliverable, and one backend's bug must not hide another's. Everything
+    below this raises normally (the pythonic default); this is the one seam that turns an exception
+    into a recorded outcome, including a TIMEOUT, so a deadlocked case is reported instead of
+    stalling the run silently.
     """
     init = get_distributed_init_method("127.0.0.1", get_open_port())
-    if case.mode == "varying":
-        driver, args = test_communicator_vary, (world, pp, case.shape, case.dtype, case.op,
-                                                case.backend, init)
-    else:
-        driver, args = test_communicator, (world, pp, case.shape, case.dtype, case.op,
-                                           case.mode == "cudagraph", case.backend, init)
     try:
-        got = driver(*args)
-    except mp.TimeoutError:
-        return Verdict(case=case, ok=False, hung=True)
-    except Exception as exc:                      # a rank raised: report it, keep going
-        return Verdict(case=case, ok=False, error=f"{type(exc).__name__}: {exc}")
-    if case.mode == "varying":
-        ok, worst, at, atol = got
-        return Verdict(case=case, ok=ok, worst_diff=worst, worst_at=at, atol=atol)
-    ok, worst, atol = got
-    return Verdict(case=case, ok=ok, worst_diff=worst, atol=atol)
+        if case.mode == "cudagraph":
+            ok, worst, at, atol = test_communicator_vary(
+                world, pp, case.shape, case.dtype, case.op, case.backend, init)
+        else:
+            ok, worst, atol = test_communicator(
+                world, pp, case.shape, case.dtype, case.op, case.backend, init)
+            at = -1
+        return Outcome(case=case, measured=Measurement(worst_diff=worst, worst_at=at, atol=atol))
+    except BaseException as exc:       # noqa: BLE001 -- a case failure is data, not a crash
+        return Outcome(case=case, failure=exc)
 
 
-def _detail(v: "Verdict") -> str:
-    """What one verdict actually knows -- a hung case has no diff, and saying `worst|diff|=0` for
+def _detail(o: Outcome) -> str:
+    """What one outcome actually knows. A hung case has no diff, and printing `worst|diff|=0` for
     one would read as a passing measurement."""
-    if v.hung:
+    if o.hung:
         return f"no answer in {CASE_TIMEOUT_S}s"
-    if v.error:
-        return v.error
-    at = f" @replay {v.worst_at}" if v.worst_at >= 0 else ""
-    return f"worst|diff|={v.worst_diff:.3g} atol={v.atol}{at}"
+    if o.failure is not None:
+        return f"{type(o.failure).__name__}: {o.failure}"
+    m = o.measured
+    assert m is not None                      # no failure and no measurement is unrepresentable
+    at = f" @replay {m.worst_at}" if m.worst_at >= 0 else ""
+    return f"worst|diff|={m.worst_diff:.3g} atol={m.atol}{at}"
 
 
-def render(verdicts: Sequence[Verdict]) -> str:
-    """The summary, as the deliverable. One line per case, in the order they ran."""
-    out = ["", "==== correctness summary ===="]
-    for v in verdicts:
-        # A hung or erroring case has no diff to report, and printing `worst|diff|=0` for one reads
-        # as a passing measurement. Each outcome says the thing it actually knows.
-        out.append(f"  [{v.label:5}] {v.case}  {_detail(v)}")
-    return "\n".join(out)
+def render(outcomes: Sequence[Outcome]) -> str:
+    """The summary, as the deliverable: one line per case, in the order they ran. PURE."""
+    return "\n".join(["", "==== correctness summary ===="]
+                     + [f"  [{o.label:5}] {o.case}  {_detail(o)}" for o in outcomes])
 
 
-def verdict_of_run(verdicts: Sequence[Verdict], control: str = "torch") -> Optional[str]:
-    """The run's single conclusion, or None if everything required passed.
+def verdict_of_run(outcomes: Sequence[Outcome], control: str = "torch") -> Optional[str]:
+    """The run's single conclusion, or None if everything passed. PURE.
 
     CONTROL FIRST, and separately: `torch` is known-good, so it failing means the HARNESS is
     unsound and every other line in the table is worthless. That is a different message from a
-    backend bug, and conflating them once cost a day of chasing the wrong thing.
+    backend bug, and conflating the two once cost a day of chasing the wrong thing.
     """
-    bad = [v for v in verdicts if not v.ok]
-    ctrl = [v for v in bad if v.case.backend == control]
+    bad = [o for o in outcomes if not o.ok]
+    ctrl = [o for o in bad if o.case.backend == control]
     if ctrl:
         return (f"CONTROL FAILED: {control} is wrong or hung under this harness "
-                f"({ctrl[0].case}). The harness is unsound; no other verdict can be trusted.")
+                f"({ctrl[0].case} -- {_detail(ctrl[0])}). The harness is unsound; no other "
+                f"verdict in the table can be trusted.")
     if bad:
-        hung = [v for v in bad if v.hung]
+        hung = [o for o in bad if o.hung]
         lead = f"{len(hung)} case(s) HUNG; " if hung else ""
-        return (f"{lead}{len(bad)} of {len(verdicts)} case(s) failed (control passed, so these are "
-                f"real backend bugs): " + "; ".join(str(v.case) for v in bad))
+        return (f"{lead}{len(bad)} of {len(outcomes)} case(s) failed (control passed, so these are "
+                f"real backend bugs): "
+                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
     return None
 
 
@@ -669,21 +682,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  {i:3}  {case}")
         return 0
 
-    verdicts: List[Verdict] = []
+    outcomes: List[Outcome] = []
     for i, case in enumerate(plan, 1):
         # Announce BEFORE running: a hang leaves this line as the last thing printed, which names
         # the case that hung. Flushed, because a hung process never drains a buffer.
         print(f"[{i}/{len(plan)}] {case}", flush=True)
-        v = run_case(case, world=args.world)
-        print(f"      -> {v.label:5}  {_detail(v)}", flush=True)
-        verdicts.append(v)
+        o = run_case(case, world=args.world)
+        print(f"      -> {o.label:5}  {_detail(o)}", flush=True)
+        outcomes.append(o)
 
-    print(render(verdicts), flush=True)
-    problem = verdict_of_run(verdicts)
+    print(render(outcomes), flush=True)
+    problem = verdict_of_run(outcomes)
     if problem:
         print(f"\n{problem}", flush=True)
         return 1
-    print(f"\nall {len(verdicts)} case(s) within tolerance", flush=True)
+    print(f"\nall {len(outcomes)} case(s) within tolerance", flush=True)
     return 0
 
 
