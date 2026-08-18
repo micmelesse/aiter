@@ -35,24 +35,6 @@ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     )
 
 
-def _fits_a_kernel_buffer(inp: torch.Tensor, *, max_size: int, dtypes: list) -> bool:
-    """Whether a KERNEL over a fixed staging buffer can take `inp`: a contiguous run of bytes,
-    16-byte aligned for vector loads, inside the buffer, in a dtype the instantiations cover.
-
-    A function rather than a base class, because these are four facts about a TENSOR and a buffer --
-    not a kind of communicator. iris and hip each carried all four inline under a comment saying the
-    two MUST agree ("two backends that accept different tensors are not comparable, and the whole
-    reason this one exists is to be measured against that one"), and a rule enforced by a comment is
-    one edit from being false. One definition, called from each; torch calls it from nowhere, because
-    NCCL has none of these limits and saying so by inheriting from a different place would put the
-    three backends at two depths for a difference that is about data.
-    """
-    if not _is_weak_contiguous(inp):
-        return False
-    nbytes = inp.numel() * inp.element_size()
-    return nbytes % 16 == 0 and nbytes < max_size and inp.dtype in dtypes
-
-
 def _rocm_arch_available() -> bool:
     try:
         props = torch.cuda.get_device_properties(0)
@@ -63,33 +45,24 @@ def _rocm_arch_available() -> bool:
 
 
 class Communicator(ABC):
-    """Interface for a TP all-reduce / all-gather backend behind vLLM's
-    CudaCommunicator.
+    """A TP all-reduce / all-gather backend behind vLLM's CudaCommunicator.
 
-    Three implementations select at one factory (make_communicator): IrisCommunicator
-    (iris gluon GPU-initiated CCL), HipCommunicator (our own HIP kernel) and
-    TorchCommunicator (a torch.distributed reference, the known-good control the
-    other two are measured and checked against). The surface mirrors what
-    CudaCommunicator calls: a ``disabled`` flag, the should_*/all_* pairs
-    (collectives are out-of-place — input untouched, new tensor returned), and a
-    capture() context entered around cudagraph capture.
-
-    THE SEQUENCE OF A CALL IS DECIDED HERE, once, and a backend supplies only the pieces it is
-    asked for. It used to be five abstract methods, so every rule about HOW to call a collective was
-    a rule the caller had to remember, and each one failed in a different register: skipping
-    `capture()` was silent for torch, dead for iris and a GPU memory fault for hip; calling
-    `all_reduce` without asking `should_allreduce` was checked by nobody at all. Now the caller
-    cannot skip a step, because the step is not theirs to take. (LOG 2026-08-18.)
+    This class owns the call SEQUENCE -- the admission gate, the capture invariant, and delegation --
+    and a backend supplies only the hooks at the bottom. Collectives are out-of-place.
     """
 
     disabled: bool
+    max_size: int
 
-    # A CLASS attribute, so a backend needs no cooperating `__init__` to get the invariant.
+    # The admission envelope, shared by EVERY backend including torch. Uniform on purpose: torch is
+    # the control, so a control that admits a superset is comparing against a different question --
+    # a shape outside the envelope would run on torch and fall back on the others.
+    _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+
+    # A class attribute, so a backend needs no cooperating `__init__` to get the invariant.
     _capturing: bool = False
 
-    # The sequence is not a suggestion: a backend that re-decides it silently gets its own rules back,
-    # which is the state this class was built to leave. Checked when the class is DEFINED -- the
-    # earliest moment available, before any run, any GPU, and any test.
+    # Checked when the class is DEFINED, the earliest moment there is.
     _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -97,17 +70,15 @@ class Communicator(ABC):
         taken = [n for n in Communicator._CALLERS_SURFACE if n in cls.__dict__]
         if taken:
             raise TypeError(
-                f"{cls.__name__} overrides {taken}, which `Communicator` owns. Supply the pieces "
-                f"instead: `_all_reduce`, `_all_gather`, `_admits_all_reduce`, `_admits_all_gather`, "
-                f"`_on_capture`. The base enforces the capture invariant and the admission gate for "
-                f"every backend, and an override skips both."
+                f"{cls.__name__} overrides {taken}, which `Communicator` owns -- an override skips "
+                f"the capture invariant and the admission gate. Supply `_all_reduce`, `_all_gather`, "
+                f"`_admits_all_reduce`, `_admits_all_gather` or `_on_capture` instead."
             )
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
-        """Whether this backend will take `inp`. The caller's question, because a caller that gets
-        False has to do something else -- vLLM falls back to another all-reduce path."""
+        """Whether this backend will take `inp`. Public because a False means the caller falls back."""
         return not self.disabled and self._admits_all_reduce(inp)
 
     def should_allgather(self, inp: torch.Tensor) -> bool:
@@ -127,11 +98,8 @@ class Communicator(ABC):
 
     @contextmanager
     def capture(self) -> Iterator[None]:
-        """Enter around a cudagraph capture. NOT optional, and now not skippable in silence: a
-        captured launch records an address that is not valid yet, so a backend has to be told.
-
-        The flag is kept here rather than by each backend because it is what makes the omission
-        detectable -- see `_check_capture`."""
+        """Enter around a cudagraph capture. Required: a captured launch records an address that is
+        not valid yet, so a backend has to be told."""
         self._capturing = True
         try:
             with self._on_capture():
@@ -142,19 +110,13 @@ class Communicator(ABC):
     # ---- The two rules a caller can get wrong, enforced once. ----
 
     def _check_capture(self, op: str) -> None:
-        """Refuse a collective recorded into a graph outside `capture()`.
-
-        Two facts observed independently: the stream says it is capturing, and this object says
-        nobody entered the context. They cannot both be right, and the caller is the one that can
-        be wrong. Raising HERE names the line; hip's version of getting this wrong was
-        `Memory access fault ... on address 0x2000` on all 8 ranks at replay, half an hour later,
-        with a null peer pointer as the only clue."""
+        """Refuse a collective recorded into a graph outside `capture()`: the stream says it is
+        capturing and this object says nobody entered the context, so the caller is wrong."""
         if torch.cuda.is_current_stream_capturing() and not self._capturing:
             raise RuntimeError(
-                f"{type(self).__name__}.{op} is being captured into a cudagraph, but "
-                f"`capture()` was never entered. Wrap the capture: "
-                f"`with comm.capture(), torch.cuda.graph(g): ...`. A backend defers work until that "
-                f"context exits (hip registers peer pointers there), so a graph captured without it "
+                f"{type(self).__name__}.{op} is being captured into a cudagraph without "
+                f"`capture()`. Use `with comm.capture(), torch.cuda.graph(g): ...` -- a backend may "
+                f"defer peer registration until that context exits, and a graph captured without it "
                 f"replays against addresses that were never registered."
             )
 
@@ -174,18 +136,23 @@ class Communicator(ABC):
         """The per-rank inputs concatenated along `dim`, rank-ordered."""
 
     def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        """Constraints beyond `disabled`. Default NONE, the honest answer for a backend with no
-        hardware limits -- torch. A kernel backend answers with `_fits_a_kernel_buffer` plus whatever
-        only it needs; the all_gather hook is separate because the two ops genuinely disagree."""
-        return True
+        """The shared envelope: a contiguous, 16-byte-aligned run of bytes inside `max_size`, in a
+        dtype the kernels cover. A backend ADDS to this; none replaces it."""
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            _is_weak_contiguous(inp)
+            and nbytes % 16 == 0
+            and nbytes < self.max_size
+            and inp.dtype in self._SUPPORTED_DTYPES
+        )
 
     def _admits_all_gather(self, inp: torch.Tensor) -> bool:
-        return True
+        """No size bound: the output is world_size x the input, and each backend bounds that its own
+        way, so a shared limit here would be a guess."""
+        return _is_weak_contiguous(inp) and inp.dtype in self._SUPPORTED_DTYPES
 
     def _on_capture(self) -> AbstractContextManager[None]:
-        """What this backend must do around a capture. Default nothing, stated by supplying nothing
-        rather than by writing an empty override -- iris's empty override set a flag no line read,
-        and it was indistinguishable from a real one."""
+        """What this backend needs around a capture. Nothing, by default."""
         return nullcontext()
 
 
@@ -200,7 +167,6 @@ class IrisCommunicator(Communicator):
     """
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
-    _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     _HEAP_SIZE = 2**33  # 8 GB
     _AG_SLAB_SIZE = 2**25  # 32 MB per rank
 
@@ -266,11 +232,10 @@ class IrisCommunicator(Communicator):
         )
 
     def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        # The shared kernel rules, plus the two facts only iris has: a live symmetric heap, and
-        # input+output having to fit in it.
+        # Ours to add: a live symmetric heap, and input+output fitting in it.
         return (
             self._shmem is not None
-            and _fits_a_kernel_buffer(inp, max_size=self.max_size, dtypes=self._SUPPORTED_DTYPES)
+            and super()._admits_all_reduce(inp)
             and inp.numel() * inp.element_size() * 2 <= self._HEAP_SIZE
         )
 
@@ -315,8 +280,8 @@ class IrisCommunicator(Communicator):
             raise
 
     def _admits_all_gather(self, inp: torch.Tensor) -> bool:
-        """Replace every NCCL all_gather; only slab capacity falls back."""
-        if self._shmem is None:
+        """Ours to add: a live heap, and the fixed per-rank slab the gather copies through."""
+        if self._shmem is None or not super()._admits_all_gather(inp):
             return False
         inp_size = inp.numel() * inp.element_size()
         if inp_size > self._AG_SLAB_SIZE:
@@ -383,27 +348,14 @@ class IrisCommunicator(Communicator):
             )
             raise
 
-    # No `_on_capture`: iris needs nothing around a capture, and now says so by supplying nothing.
-    # It used to override `capture()` to set `self._IS_CAPTURING`, which NO line in this file reads --
-    # copied from `custom_all_reduce.py`, where the flag does have readers. An override that does
-    # nothing was indistinguishable from hip's, which does the thing the whole hook exists for.
+    # No `_on_capture`: iris needs nothing around a capture.
 
 
 class TorchCommunicator(Communicator):
-    """torch.distributed reference with the Communicator interface — the
-    known-good control IrisCommunicator is measured and checked against.
+    """torch.distributed reference: the known-good control the other backends are checked against.
 
-    Same output contract as IrisCommunicator: all_reduce returns a new SUM tensor
-    (input untouched); all_gather returns the per-rank inputs concatenated along
-    ``dim``, rank-ordered. These are GPU-tensor collectives, so they run over the
-    ``device_group`` (nccl/rccl); the gloo ``cpu_group`` (for CPU-object/IPC-handle
-    handshakes) is accepted for interface parity but unused here.
-
-    The should_* gates accept everything (torch.distributed is correct at any
-    size/dtype), so this routes the same calls the iris path would plus the larger
-    ones iris gates to NCCL. That is fine for the correctness control; aligning the
-    gates with iris for routing parity is a perf-decomposition concern, not needed
-    here.
+    Collectives run over `device_group` (nccl/rccl); the gloo `cpu_group` is accepted for interface
+    parity and unused. It admits exactly what the others admit, taking the shared envelope unchanged.
     """
 
     def __init__(
@@ -425,9 +377,8 @@ class TorchCommunicator(Communicator):
         self.world_size = dist.get_world_size(device_group)
         self.disabled = False
 
-    # No `_admits_*` and no `_on_capture`: torch.distributed has no size, alignment or dtype limit
-    # this needs to express, and its collectives need no capture handling. Both are stated by
-    # supplying nothing, which is why the base defaults are what they are.
+    # Supplies neither `_admits_*` nor `_on_capture`: it takes the shared envelope unchanged -- the
+    # control has to admit exactly what it is a control for -- and needs no capture handling.
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.clone()
@@ -453,37 +404,16 @@ class TorchCommunicator(Communicator):
 
 
 class HipCommunicator(Communicator):
-    """Communicator backed by HIP collectives we own (`hip_comms.cu` in this directory).
+    """Communicator over HIP collectives we own: `hip_comms.cu` beside this file, compiled by
+    `hip_comms.py`, depending on torch and the HIP runtime only.
 
-    The point of this backend is CONTROL, not (yet) speed. The iris backend's
-    performance depends on someone else's kernel schedule; this one is ours, so it
-    can be pushed as hard as the hardware allows without waiting on anyone. Its v1
-    target is therefore PARITY with the incumbent, not beating it -- it is the
-    platform every later comms experiment runs on.
-
-    ALGORITHM (decided by measurement, 2026-07-30, not by preference): TWO-STAGE
-    (reduce-scatter then all-gather), not one-shot. At the decode operating point
-    a TP=8 all-reduce moves [64, 8192] bf16 = 1 MiB, and there a one-shot moves
-    ~4x the bytes of a two-stage; measured, iris's `one_shot_all_reduce_gluon` ran
-    ~37.8us against baseline's two-stage at ~22.2us on the same run. A one-shot
-    only pays below ~1 MiB, so it is the wrong starting algorithm for this
-    workload -- worth revisiting only if the message shrinks (lower concurrency or
-    a smaller hidden dim).
-
-    The kernel is `hip_comms.cu` beside this file, compiled by `hip_comms.py`. It
-    depends on torch and the HIP runtime only -- nothing from aiter's `csrc`, which is
-    not ours -- so the whole path from Python down to the launch is code we control.
-
-    It self-disables for the same reasons `IrisCommunicator` does (unsupported arch,
-    unsupported world size). A failed COMPILE is not one of them and raises: a missing
-    iris is genuine unavailability, but our own source failing to build would leave
-    vLLM falling back to its own all-reduce and calling the run READY.
+    Self-disables on an unsupported arch or world size. A failed COMPILE instead RAISES -- disabling
+    would let vLLM fall back to its own all-reduce and report the run READY.
     """
 
     # Matches IrisCommunicator: a two-stage reduce-scatter needs the element count
     # divisible by the world size, and these are the TP widths we actually run.
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
-    _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
 
     def __init__(
         self,
@@ -536,20 +466,11 @@ class HipCommunicator(Communicator):
         )
 
     def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        # ONE definition of the shared rules, called from here and from iris -- which is what makes
-        # the two comparable, the property that comment used to only ask for.
-        # The extra is ours: a two-stage reduce-scatter splits the buffer across ranks, so a count
-        # that does not divide is a correctness hazard rather than a slow path.
-        return (
-            _fits_a_kernel_buffer(inp, max_size=self.max_size, dtypes=self._SUPPORTED_DTYPES)
-            and inp.numel() % self.world_size == 0
-        )
+        # Ours to add: a two-stage reduce-scatter splits the buffer across ranks, so a count that
+        # does not divide is a correctness hazard rather than a slow path.
+        return super()._admits_all_reduce(inp) and inp.numel() % self.world_size == 0
 
-    def _admits_all_gather(self, inp: torch.Tensor) -> bool:
-        # NOT the shared all_reduce rules: a gather has no staging buffer to overflow, so size does
-        # not gate it. Deliberately different from iris, which gates on slab size and ignores these
-        # two -- see `KernelCommunicator`.
-        return _is_weak_contiguous(inp) and inp.dtype in self._SUPPORTED_DTYPES
+    # No `_admits_all_gather`: the shared envelope is exactly what this backend needs.
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks. The launch config is chosen in `hip_comms`."""
@@ -562,11 +483,8 @@ class HipCommunicator(Communicator):
         return self._comms.all_gather(inp.contiguous(), dim)
 
     def _on_capture(self) -> AbstractContextManager[None]:
-        # The whole reason the hook exists: a captured input's address is not registered
-        # when the launch is recorded, so the context reserves a slot during capture and
-        # exchanges the IPC handles for everything recorded on the way out. Skipping it left the
-        # peer-pointer slot null and faulted all 8 ranks at replay, which is what `_check_capture`
-        # now refuses up front.
+        # A captured input's address is not registered when the launch is recorded, so the context
+        # reserves a slot during capture and exchanges the IPC handles on the way out.
         return self._comms.capture()
 
 
@@ -579,23 +497,11 @@ def make_communicator(
 ) -> Communicator:
     """Construct the TP collective backend at the one branching point.
 
-    Takes both of vLLM's process groups (mirroring DeviceCommunicatorBase): the
-    gloo ``cpu_group`` (CPU-object/IPC-handle handshakes) and the nccl/rccl
-    ``device_group`` (GPU tensor collectives). Each backend uses what it needs —
-    the torch reference runs its collectives over ``device_group``; iris uses
-    neither (its own symmetric-heap CCL).
+    Takes both of vLLM's process groups and each backend uses what it needs. The backend comes from
+    the `backend` argument or `AITER_COMMS_BACKEND`, with NO default, so it is always an explicit
+    choice; a missing or unknown one raises.
 
-    'iris' is the gluon GPU-initiated CCL; 'hip' is our own HIP kernel (the backend
-    we control, so its schedule is not someone else's); 'torch' is the torch.distributed
-    reference/control. The caller (vLLM) stays backend-agnostic and passes nothing; the
-    backend is then resolved from ``AITER_COMMS_BACKEND``. There is
-    NO default — if neither the ``backend`` argument (used by the tests) nor the
-    env var is set, this raises, so the backend is always an explicit choice.
-
-    Returns the communicator without raising on *unavailability* — the caller
-    checks ``.disabled`` (IrisCommunicator self-disables on unsupported arch /
-    missing iris / unsupported world size). A missing or unknown backend is a
-    config error, not unavailability, and raises.
+    Unavailability does NOT raise -- the caller checks `.disabled`. A config error does.
     """
     if backend is None:
         backend = os.environ.get("AITER_COMMS_BACKEND")

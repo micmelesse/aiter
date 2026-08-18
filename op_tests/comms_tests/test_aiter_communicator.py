@@ -410,19 +410,10 @@ def _run_eager(comm, op, inputs, static_in):
 def _run_graph(comm, op, inputs, static_in):
     """Capture once, then replay with a FRESH input each time. One output per replay.
 
-    The capture is wrapped in `comm.capture()`, which is part of the Communicator interface and is
-    NOT optional: a backend is told when it is being captured because a captured launch records an
-    address that is not yet valid. hip defers its peer-pointer registration and completes it on exit;
-    iris switches its barrier behaviour. Omitting it faulted all 8 ranks on a null peer pointer
-    (`Memory access fault ... on address 0x2000`) and made iris's graph results meaningless -- and the
-    torch CONTROL could not catch either, because its `capture()` is a bare `yield`. See LOG 2026-08-18.
-
-    The graph is a LOCAL, so it is freed when this returns -- which must happen BEFORE the process
-    group is destroyed. A live captured graph holds the communicator's work, and
-    `destroy_process_group` then blocks forever draining work the graph still owns.
-
-    Only a cheap snapshot copy sits between replays so they stay back-to-back; an elided end barrier
-    needs that to race. All checking happens after a single sync.
+    Three things this shape is load-bearing for: `comm.capture()` is required (a backend may defer
+    registration until it exits); the graph is a LOCAL so it dies before `destroy_process_group`,
+    which otherwise blocks forever draining work a live graph owns; and only a snapshot copy sits
+    between replays, because an elided end barrier needs them back-to-back to race.
     """
     for _ in range(3):          # warm up so first-call allocations happen before capture
         out = op()
