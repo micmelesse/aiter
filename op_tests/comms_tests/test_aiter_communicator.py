@@ -23,7 +23,11 @@ the dropped/stale all_gather race the identical-input loop misses.
 import argparse
 import logging
 import os
+from dataclasses import dataclass
+import multiprocessing as mp
+import time
 from multiprocessing import Pool, freeze_support, set_start_method
+from typing import List, Sequence, Tuple
 from typing_extensions import Optional
 
 import torch
@@ -92,6 +96,70 @@ _BACKEND_CLASS = {
 # iterating on last means waiting most of that before learning anything about it.
 # Subset with `-b`.
 BACKENDS = ("torch", "hip", "iris")
+
+
+# ── THE DOMAIN: one type, one generator ──
+# What this suite explores is a TYPE, not four module-level lists read in a five-deep nest. A
+# reader answers "what does this cover" from `Case` and `cases()` alone, and one failing case is
+# nameable, so re-running exactly it is possible.
+#
+# NOT `@given`: our default is property-first (CONTRIBUTING *Property tests by default*), and this
+# is the stated distributed exception -- Hypothesis cannot drive across spawned ranks and each
+# shrink step would be a full 8-process run, so the sweep is hand-coded (CONTRIBUTING *Shrink and
+# bisect the input axis*). The domain is small and enumerated on purpose.
+
+MODES = ("eager", "cudagraph", "varying")
+
+
+@dataclass(frozen=True)
+class Case:
+    """ONE unit of work: which backend, which collective, at what dtype and shape, replayed how.
+
+    `mode` is the axis that used to be duplicated code -- `eager`/`cudagraph` went through one
+    driver and `varying` through a near-identical second one.
+    """
+
+    backend: str
+    op: str
+    dtype: "torch.dtype"
+    shape: Tuple[int, ...]
+    mode: str
+
+    def __str__(self) -> str:
+        return f"{self.backend:5} {self.op:11} {str(self.shape):12} {str(self.dtype):14} {self.mode}"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What one case produced. `hung` is its own outcome, not a flavour of failure: a case that
+    never answered tells you something different from one that answered wrongly."""
+
+    case: Case
+    ok: bool
+    worst_diff: float = 0.0
+    worst_at: int = -1          # replay index for `varying`; -1 where there is no such thing
+    atol: float = 0.0
+    hung: bool = False
+    error: str = ""
+
+    @property
+    def label(self) -> str:
+        if self.hung:
+            return "HUNG"
+        return "OK  " if self.ok else ("ERROR" if self.error else "FAIL")
+
+
+def cases(backends: Sequence[str], ops: Sequence[str], dts: Sequence["torch.dtype"],
+          shapes: Sequence[Tuple[int, ...]], modes: Sequence[str] = MODES) -> List[Case]:
+    """THE matrix, and the only place its order is decided.
+
+    BACKEND is outermost so the control runs first: torch is known-good, so if it fails the harness
+    is unsound and no later verdict means anything. MODE is innermost so everything about one
+    (backend, op, dtype, shape) is known before moving on -- with the modes split across two phases,
+    a hang in `varying` was reachable only after the whole identical-input matrix had passed.
+    """
+    return [Case(b, op, dt, sh, m)
+            for b in backends for op in ops for dt in dts for sh in shapes for m in modes]
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
@@ -258,6 +326,30 @@ def tolerance(op_name, dtype):
     return 0.1 if dtype == torch.bfloat16 else 0.01
 
 
+CASE_TIMEOUT_S = 600
+
+
+def _collect(pool, rets):
+    """Every rank's result, or raise `mp.TimeoutError` once `CASE_TIMEOUT_S` is up.
+
+    THE reason this exists rather than `pool.join()`: join waits forever. On 2026-08-18 all eight
+    ranks deadlocked inside `destroy_process_group` and the driver sat in join with nothing printed
+    for eight minutes. `AsyncResult.get(timeout=...)` is what makes a hang a reportable outcome, and
+    `terminate()` is what stops the ranks so the next case can have the GPUs.
+    """
+    deadline = time.monotonic() + CASE_TIMEOUT_S
+    out = []
+    try:
+        for r in rets:
+            out.append(r.get(timeout=max(1.0, deadline - time.monotonic())))
+    except mp.TimeoutError:
+        pool.terminate()
+        pool.join()
+        raise
+    pool.join()
+    return out
+
+
 def test_communicator(
     tp_size,
     pp_size,
@@ -292,8 +384,7 @@ def test_communicator(
         for i in range(tp_size)
     ]
     pool.close()
-    pool.join()
-    rets = [el.get() for el in rets]
+    rets = _collect(pool, rets)
     # Return a verdict rather than raising, for the same reason the varying-input
     # driver does: the caller runs EVERY backend before deciding, so one backend's
     # failure must not abort the others. Same allclose semantics as that path.
@@ -459,9 +550,7 @@ def test_communicator_vary(
         )
         for i in range(tp_size)
     ]
-    pool.close()
-    pool.join()
-    rets = [el.get() for el in rets]  # each rank: (ok, worst_diff, worst_k)
+    rets = _collect(pool, rets)      # each rank: (ok, worst_diff, worst_k)
     atol = tolerance(op_name, dtype)
     ok = all(r[0] for r in rets)  # every rank's every replay was allclose
     worst = max(rets, key=lambda r: r[1])  # rank with the largest abs diff
@@ -471,6 +560,143 @@ def test_communicator_vary(
         f"{'OK' if ok else 'FAIL'} (worst |diff|={worst_diff:.3g} atol={atol} @replay {worst_k})"
     )
     return ok, worst_diff, worst_k, atol
+
+
+# ── ONE driver, and the timeout that makes a hang REPORTABLE ──
+
+# A case that has not answered in this long is hung, not slow. The whole matrix at its largest
+# shape ran in well under a minute per case when it worked, so this is generous by an order of
+# magnitude and still catches the failure it exists for. Without it a deadlocked case sits until
+# gk's 4h workload deadline and the run reports nothing at all -- which is what happened on
+# 2026-08-17 (killed at 30min by gloo's own timeout) and again on 2026-08-18 (killed by hand at 8min).
+def run_case(case: Case, world: int = 8, pp: int = 1) -> Verdict:
+    """Run ONE case across `world` ranks and return its verdict. Never raises for a case failure.
+
+    Collects rather than raises so a failing case does not abandon the ones after it: the summary
+    is the deliverable, and one backend's bug must not hide another's. A TIMEOUT is a verdict too --
+    the ranks are terminated and the case is reported HUNG, so the run continues and says which
+    case never answered instead of stalling silently.
+    """
+    init = get_distributed_init_method("127.0.0.1", get_open_port())
+    if case.mode == "varying":
+        driver, args = test_communicator_vary, (world, pp, case.shape, case.dtype, case.op,
+                                                case.backend, init)
+    else:
+        driver, args = test_communicator, (world, pp, case.shape, case.dtype, case.op,
+                                           case.mode == "cudagraph", case.backend, init)
+    try:
+        got = driver(*args)
+    except mp.TimeoutError:
+        return Verdict(case=case, ok=False, hung=True)
+    except Exception as exc:                      # a rank raised: report it, keep going
+        return Verdict(case=case, ok=False, error=f"{type(exc).__name__}: {exc}")
+    if case.mode == "varying":
+        ok, worst, at, atol = got
+        return Verdict(case=case, ok=ok, worst_diff=worst, worst_at=at, atol=atol)
+    ok, worst, atol = got
+    return Verdict(case=case, ok=ok, worst_diff=worst, atol=atol)
+
+
+def _detail(v: "Verdict") -> str:
+    """What one verdict actually knows -- a hung case has no diff, and saying `worst|diff|=0` for
+    one would read as a passing measurement."""
+    if v.hung:
+        return f"no answer in {CASE_TIMEOUT_S}s"
+    if v.error:
+        return v.error
+    at = f" @replay {v.worst_at}" if v.worst_at >= 0 else ""
+    return f"worst|diff|={v.worst_diff:.3g} atol={v.atol}{at}"
+
+
+def render(verdicts: Sequence[Verdict]) -> str:
+    """The summary, as the deliverable. One line per case, in the order they ran."""
+    out = ["", "==== correctness summary ===="]
+    for v in verdicts:
+        # A hung or erroring case has no diff to report, and printing `worst|diff|=0` for one reads
+        # as a passing measurement. Each outcome says the thing it actually knows.
+        out.append(f"  [{v.label:5}] {v.case}  {_detail(v)}")
+    return "\n".join(out)
+
+
+def verdict_of_run(verdicts: Sequence[Verdict], control: str = "torch") -> Optional[str]:
+    """The run's single conclusion, or None if everything required passed.
+
+    CONTROL FIRST, and separately: `torch` is known-good, so it failing means the HARNESS is
+    unsound and every other line in the table is worthless. That is a different message from a
+    backend bug, and conflating them once cost a day of chasing the wrong thing.
+    """
+    bad = [v for v in verdicts if not v.ok]
+    ctrl = [v for v in bad if v.case.backend == control]
+    if ctrl:
+        return (f"CONTROL FAILED: {control} is wrong or hung under this harness "
+                f"({ctrl[0].case}). The harness is unsound; no other verdict can be trusted.")
+    if bad:
+        hung = [v for v in bad if v.hung]
+        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
+        return (f"{lead}{len(bad)} of {len(verdicts)} case(s) failed (control passed, so these are "
+                f"real backend bugs): " + "; ".join(str(v.case) for v in bad))
+    return None
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Every input EXPLICIT, in one place: parse, build the matrix, run it, report, decide.
+
+    The five steps are the whole program and they are visible in order. This replaced a 107-line
+    `__main__` block that inlined two five-deep loop nests, its own progress counters, its own
+    summary formatting and its own verdict logic -- so the matrix, the running and the judging
+    could not be read or changed independently.
+    """
+    freeze_support()
+    args = parser.parse_args(argv)
+
+    # Cheap and first: no GPU, no process group. A silently wrong backend does not crash, it
+    # returns numbers for something you did not ask for.
+    check_backend_selection()
+
+    backends = _pick(args.backend, BACKENDS, "backend")
+    modes = _pick(args.mode, MODES, "mode")
+    dts = ([dtypes.d_dtypes[args.dtype]] if args.dtype
+           else [dtypes.d_dtypes[k] for k in l_dtype])
+    shapes = [args.shape] if args.shape else list(l_shape)
+
+    plan = cases(backends, OPS, dts, shapes, modes)
+    print(f"world={args.world}  backends={backends}  modes={list(modes)}  "
+          f"dtypes={[str(d) for d in dts]}  shapes={shapes}")
+    print(f"{len(plan)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
+
+    if args.list:
+        for i, case in enumerate(plan, 1):
+            print(f"  {i:3}  {case}")
+        return 0
+
+    verdicts: List[Verdict] = []
+    for i, case in enumerate(plan, 1):
+        # Announce BEFORE running: a hang leaves this line as the last thing printed, which names
+        # the case that hung. Flushed, because a hung process never drains a buffer.
+        print(f"[{i}/{len(plan)}] {case}", flush=True)
+        v = run_case(case, world=args.world)
+        print(f"      -> {v.label:5}  {_detail(v)}", flush=True)
+        verdicts.append(v)
+
+    print(render(verdicts), flush=True)
+    problem = verdict_of_run(verdicts)
+    if problem:
+        print(f"\n{problem}", flush=True)
+        return 1
+    print(f"\nall {len(verdicts)} case(s) within tolerance", flush=True)
+    return 0
+
+
+def _pick(raw: Optional[str], known: Sequence[str], what: str) -> List[str]:
+    """A comma-separated subset of `known`, in `known`'s order. Unknown names REFUSE rather than
+    silently narrowing the run to nothing."""
+    if not raw:
+        return list(known)
+    asked = [s.strip() for s in raw.split(",") if s.strip()]
+    unknown = [s for s in asked if s not in known]
+    if unknown:
+        raise SystemExit(f"unknown {what}(s) {unknown}; known: {list(known)}")
+    return [k for k in known if k in asked]
 
 
 l_dtype = ["fp16", "bf16"]
@@ -497,6 +723,26 @@ parser.add_argument(
     help="shape. e.g. -s 128,8192",
 )
 parser.add_argument(
+    "-l",
+    "--list",
+    action="store_true",
+    help="print the matrix and exit, running nothing (what WILL run, before spending GPUs on it)",
+)
+parser.add_argument(
+    "-m",
+    "--mode",
+    type=str,
+    default=None,
+    help=f"comma-separated subset of {','.join(MODES)} (default: all)",
+)
+parser.add_argument(
+    "-w",
+    "--world",
+    type=int,
+    default=8,
+    help="ranks to run each case across (default: 8)",
+)
+parser.add_argument(
     "-b",
     "--backend",
     type=str,
@@ -506,109 +752,4 @@ parser.add_argument(
 
 
 if __name__ == "__main__":
-    freeze_support()
-    args = parser.parse_args()
-    # Before any GPU work: prove the selector returns what it is asked for.
-    check_backend_selection()
-    if args.dtype is None:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-    else:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    if args.shape is not None:
-        l_shape = [args.shape]
-    if args.backend:
-        backends = [b.strip() for b in args.backend.split(",") if b.strip()]
-        unknown = [b for b in backends if b not in BACKENDS]
-        if unknown:
-            raise SystemExit(f"unknown backend(s) {unknown}; known: {list(BACKENDS)}")
-        # Keep BACKENDS' order whatever order was typed, so the control still runs first and a
-        # harness failure is distinguishable from a backend failure.
-        backends = [b for b in BACKENDS if b in backends]
-    else:
-        backends = list(BACKENDS)
-    print(f"backends: {backends}")
-
-    # Every backend, every collective, identical-input eager then cudagraph capture +
-    # replay. Verdicts are COLLECTED, not raised on, so one backend's failure does not
-    # hide the rest -- the whole picture lands in one run.
-    summary = []  # (phase, backend, op, dtype, shape, ok, worst_diff, worst_k, atol)
-    # Announce each case BEFORE running it. A new barrier is likelier to deadlock than to
-    # answer wrong, and a deadlock with no per-case output leaves you guessing which of 108
-    # cases hung. Flushed, because a hung process never gets to drain a buffer.
-    total = len(backends) * len(OPS) * len(l_dtype) * len(l_shape)
-    done = 0
-    for backend in backends:
-        for op_name in OPS:
-            for dtype in l_dtype:
-                for shape in l_shape:
-                    for capture in (False, True):
-                        phase = "cudagraph" if capture else "eager"
-                        done += 1
-                        print(f"[case {done}/{total * 2}] {backend} {op_name} {shape} "
-                              f"{dtype} {phase}", flush=True)
-                        ok, wd, atol = test_communicator(
-                            8,
-                            1,
-                            shape,
-                            dtype,
-                            op_name,
-                            capture,
-                            backend,
-                            distributed_init_method=get_distributed_init_method(
-                                "127.0.0.1", get_open_port()
-                            ),
-                        )
-                        summary.append(
-                            (phase, backend, op_name, dtype, shape, ok, wd, -1, atol)
-                        )
-
-    # Then the varying-input cudagraph check — fresh input per replay, each
-    # checked against its own reference. This is the one that catches a
-    # dropped/stale symmetric-heap read (which identical-input replays hide).
-    def _init():
-        return get_distributed_init_method("127.0.0.1", get_open_port())
-
-    vary_done = 0
-    for backend in backends:
-        for op_name in OPS:
-            for dtype in l_dtype:
-                for shape in l_shape:
-                    vary_done += 1
-                    print(f"[vary {vary_done}/{total}] {backend} {op_name} {shape} {dtype}",
-                          flush=True)
-                    ok, wd, wk, atol = test_communicator_vary(
-                        8, 1, shape, dtype, op_name, backend, _init()
-                    )
-                    summary.append(
-                        ("vary", backend, op_name, dtype, shape, ok, wd, wk, atol)
-                    )
-
-    print("\n==== correctness summary ====")
-    for phase, backend, op_name, dt, sh, ok, wd, wk, atol in summary:
-        print(
-            f"  [{backend:5}] {phase:9} {op_name:11} {str(sh):12} {str(dt):16} "
-            f"{'OK  ' if ok else 'FAIL'} worst|diff|={wd:.3g} atol={atol} @replay {wk}"
-        )
-
-    # CONTROL FIRST. torch.distributed is known-good, so it failing means the HARNESS is
-    # wrong and every other verdict in the table is worthless -- a distinct, louder error
-    # than a backend bug.
-    control_fail = [s for s in summary if s[1] == "torch" and not s[5]]
-    assert not control_fail, (
-        "CONTROL FAILED: torch.distributed (known-good) is wrong under this harness "
-        f"({control_fail[0][6]:.3g} > atol {control_fail[0][8]}). The harness is unsound; "
-        "no other result in the table can be trusted until this is fixed."
-    )
-
-    # Then the backends under test. Control passed, so these are real bugs.
-    failed = [s for s in summary if not s[5]]
-    if failed:
-        raise AssertionError(
-            "collectives are WRONG (control passed, so these are real backend bugs, "
-            "not test artifacts): "
-            + "; ".join(
-                f"{b}/{phase} {op} {sh} {dt} worst|diff|={wd:.3g}>{atol} @replay {wk}"
-                for phase, b, op, dt, sh, _, wd, wk, atol in failed
-            )
-        )
-    print("all cases within tolerance")
+    raise SystemExit(main())
