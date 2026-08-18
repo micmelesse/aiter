@@ -53,6 +53,7 @@ class Communicator(ABC):
 
     disabled: bool
     max_size: int
+    world_size: int
 
     # The admission envelope, shared by EVERY backend including torch. Uniform on purpose: torch is
     # the control, so a control that admits a superset is comparing against a different question --
@@ -63,7 +64,8 @@ class Communicator(ABC):
     _capturing: bool = False
 
     # Checked when the class is DEFINED, the earliest moment there is.
-    _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture")
+    _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture",
+                        "_admits")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -72,17 +74,34 @@ class Communicator(ABC):
             raise TypeError(
                 f"{cls.__name__} overrides {taken}, which `Communicator` owns -- an override skips "
                 f"the capture invariant and the admission gate. Supply `_all_reduce`, `_all_gather`, "
-                f"`_admits_all_reduce`, `_admits_all_gather` or `_on_capture` instead."
+                f"or `_on_capture` instead -- admission is not a backend's to redefine."
             )
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         """Whether this backend will take `inp`. Public because a False means the caller falls back."""
-        return not self.disabled and self._admits_all_reduce(inp)
+        return not self.disabled and self._admits(inp)
 
     def should_allgather(self, inp: torch.Tensor) -> bool:
-        return not self.disabled and self._admits_all_gather(inp)
+        return not self.disabled and self._admits(inp)
+
+    def _admits(self, inp: torch.Tensor) -> bool:
+        """THE envelope, identical for every backend and every op, so the three arms do the same work
+        and differ only in the code that runs: a contiguous, 16-byte-aligned run of bytes under
+        `max_size`, in a covered dtype, with a count the ranks divide evenly.
+
+        No backend hook. A per-backend rule would mean an input one arm runs and another declines,
+        which makes the arms incomparable -- and whether a given tensor is in scope is a question
+        about the CONFIGURATION, answered once at construction by `disabled`."""
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            _is_weak_contiguous(inp)
+            and nbytes % 16 == 0
+            and nbytes < self.max_size
+            and inp.dtype in self._SUPPORTED_DTYPES
+            and inp.numel() % self.world_size == 0
+        )
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         self._check_capture("all_reduce")
@@ -129,27 +148,12 @@ class Communicator(ABC):
 
     @abstractmethod
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """SUM across ranks, out of place: input untouched, new tensor returned."""
+        """SUM across ranks, out of place: input untouched, new tensor returned. Assume `inp` is
+        admitted -- the base checked."""
 
     @abstractmethod
     def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """The per-rank inputs concatenated along `dim`, rank-ordered."""
-
-    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        """The shared envelope: a contiguous, 16-byte-aligned run of bytes inside `max_size`, in a
-        dtype the kernels cover. A backend ADDS to this; none replaces it."""
-        nbytes = inp.numel() * inp.element_size()
-        return (
-            _is_weak_contiguous(inp)
-            and nbytes % 16 == 0
-            and nbytes < self.max_size
-            and inp.dtype in self._SUPPORTED_DTYPES
-        )
-
-    def _admits_all_gather(self, inp: torch.Tensor) -> bool:
-        """No size bound: the output is world_size x the input, and each backend bounds that its own
-        way, so a shared limit here would be a guess."""
-        return _is_weak_contiguous(inp) and inp.dtype in self._SUPPORTED_DTYPES
 
     def _on_capture(self) -> AbstractContextManager[None]:
         """What this backend needs around a capture. Nothing, by default."""
@@ -215,6 +219,7 @@ class IrisCommunicator(Communicator):
             return
 
         world_size = self._shmem.num_ranks
+        self.world_size = world_size
         if world_size not in self._SUPPORTED_WORLD_SIZES:
             logger.debug(
                 "IrisCommunicator disabled: world_size=%d not in %s",
@@ -223,6 +228,14 @@ class IrisCommunicator(Communicator):
             )
             return
 
+        # The heap and the slab are limits on the CONFIGURATION, not on a tensor: if `max_size` fits
+        # inside both, no admitted input can exceed either, so nothing needs re-checking per call.
+        if max_size * 2 > self._HEAP_SIZE or max_size > self._AG_SLAB_SIZE:
+            logger.warning(
+                "IrisCommunicator disabled: max_size=%dMB does not fit heap=%dGB / slab=%dMB",
+                max_size >> 20, self._HEAP_SIZE >> 30, self._AG_SLAB_SIZE >> 20,
+            )
+            return
         self.disabled = False
         logger.info(
             "IrisCommunicator ready: world_size=%d heap=%dGB max_size=%dMB",
@@ -231,13 +244,8 @@ class IrisCommunicator(Communicator):
             self.max_size >> 20,
         )
 
-    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        # Ours to add: a live symmetric heap, and input+output fitting in it.
-        return (
-            self._shmem is not None
-            and super()._admits_all_reduce(inp)
-            and inp.numel() * inp.element_size() * 2 <= self._HEAP_SIZE
-        )
+    # No admission of its own: `_shmem is None` already means `disabled`, and the heap and slab are
+    # checked against `max_size` at construction.
 
     def _get_buffers(self, shape, dtype):
         if self._buf_shape != shape or self._buf_dtype != dtype:
@@ -279,19 +287,6 @@ class IrisCommunicator(Communicator):
             )
             raise
 
-    def _admits_all_gather(self, inp: torch.Tensor) -> bool:
-        """Ours to add: a live heap, and the fixed per-rank slab the gather copies through."""
-        if self._shmem is None or not super()._admits_all_gather(inp):
-            return False
-        inp_size = inp.numel() * inp.element_size()
-        if inp_size > self._AG_SLAB_SIZE:
-            logger.warning(
-                "IrisCommunicator.all_gather fallback to NCCL: %d bytes "
-                "exceeds slab",
-                inp_size,
-            )
-            return False
-        return True
 
     def _get_allgather_buffers(self, numel, dtype):
         # Fixed byte slabs allocated once; per-call views avoid heap churn
@@ -465,12 +460,9 @@ class HipCommunicator(Communicator):
             self.max_size >> 20,
         )
 
-    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        # Ours to add: a two-stage reduce-scatter splits the buffer across ranks, so a count that
-        # does not divide is a correctness hazard rather than a slow path.
-        return super()._admits_all_reduce(inp) and inp.numel() % self.world_size == 0
+    # No admission of its own: the count-divides-the-ranks rule a two-stage reduce-scatter needs is
+    # in the shared envelope, so every arm refuses the same shapes.
 
-    # No `_admits_all_gather`: the shared envelope is exactly what this backend needs.
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks. The launch config is chosen in `hip_comms`."""
