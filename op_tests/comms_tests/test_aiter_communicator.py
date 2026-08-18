@@ -446,7 +446,8 @@ def run_rank(rank, world, pp, case, init_method):
     return verdict
 
 
-def run_case(case: Case, world: int = 8, pp: int = 1) -> Outcome:
+def run_case(case: Case, world: int = 8, pp: int = 1, addr: str = "127.0.0.1",
+             port: int = 0) -> Outcome:
     """Run ONE case across `world` ranks. THE boundary: the only place a case failure is caught.
 
     Was two drivers (one per input policy) that each spawned a pool, aggregated, and formatted a
@@ -457,10 +458,14 @@ def run_case(case: Case, world: int = 8, pp: int = 1) -> Outcome:
     below raises normally; this seam turns an exception into a recorded outcome, a TIMEOUT included,
     so a deadlocked case is reported instead of stalling the run silently.
     """
-    init = get_distributed_init_method("127.0.0.1", get_open_port())
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49373"
+    # The rendezvous, and the ONLY channel for it: `tcp://<addr>:<port>`, passed to every rank.
+    # `MASTER_ADDR`/`MASTER_PORT` used to be set here too, the port hardcoded to 49373 while the
+    # init method got a free one -- two different ports for one rendezvous. They were also DEAD:
+    # nothing in `aiter/dist/` reads either, and torch only consults them for `init_method="env://"`,
+    # which this never uses. A hardcoded port is a collision between two runs on a shared box, so
+    # the fix is one source of truth that defaults to a FREE port per case.
     pool = Pool(processes=world)
+    init = get_distributed_init_method(addr, port or get_open_port())
     try:
         rets = [pool.apply_async(run_rank, args=(r, world, pp, case, init)) for r in range(world)]
         pool.close()
@@ -540,7 +545,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     shapes = [args.shape] if args.shape else list(l_shape)
 
     plan = cases(backends, OPS, dts, shapes, modes)
-    print(f"world={args.world}  backends={backends}  modes={list(modes)}  "
+    print(f"world={args.world}  rendezvous={args.addr}:{args.port or 'free'}  "
+          f"backends={backends}  modes={list(modes)}  "
           f"dtypes={[str(d) for d in dts]}  shapes={shapes}")
     print(f"{len(plan)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
 
@@ -554,7 +560,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Announce BEFORE running: a hang leaves this line as the last thing printed, which names
         # the case that hung. Flushed, because a hung process never drains a buffer.
         print(f"[{i}/{len(plan)}] {case}", flush=True)
-        o = run_case(case, world=args.world)
+        o = run_case(case, world=args.world, addr=args.addr, port=args.port)
         print(f"      -> {o.label:5}  {_detail(o)}", flush=True)
         outcomes.append(o)
 
@@ -601,6 +607,19 @@ parser.add_argument(
     const=None,
     default=None,
     help="shape. e.g. -s 128,8192",
+)
+parser.add_argument(
+    "--addr",
+    type=str,
+    default="127.0.0.1",
+    help="rendezvous address the ranks connect to (default: 127.0.0.1)",
+)
+parser.add_argument(
+    "--port",
+    type=int,
+    default=0,
+    help="rendezvous port; 0 (default) picks a FREE one per case, so two runs on a shared box "
+         "cannot collide. Pin it only to debug a specific rendezvous.",
 )
 parser.add_argument(
     "-l",
