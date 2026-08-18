@@ -385,6 +385,11 @@ def rendezvous() -> Tuple[str, int]:
     return "127.0.0.1", get_open_port()
 
 
+try:
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce as _VLLM_CAR
+except ImportError:                      # the transcribed numbers below stand on their own
+    _VLLM_CAR = None
+
 # vLLM's CustomAllreduce admission, TRANSCRIBED rather than imported. It is the path these backends
 # replace, so it is the envelope they have to match -- and writing the rule down is what makes the
 # match reviewable. Two reasons not to import it:
@@ -411,6 +416,14 @@ def baseline_admits(nbytes: int) -> bool:
     return nbytes % BASELINE_ALIGNMENT == 0 and nbytes < BASELINE_MAX_SIZE
 
 
+def _upstream(world_size: int):
+    """vLLM's real CustomAllreduce, with only the attributes its admission reads."""
+    car = object.__new__(_VLLM_CAR)
+    car.disabled, car.world_size, car.fully_connected = False, world_size, True
+    car.max_size = BASELINE_MAX_SIZE
+    return car
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_admission_matches_the_baseline(world_size: int) -> None:
     """Every backend admits exactly what vLLM's CustomAllreduce does.
@@ -423,6 +436,7 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
     """
     ours = object.__new__(TorchCommunicator)
     ours.disabled, ours.world_size, ours.max_size = False, world_size, BASELINE_MAX_SIZE
+    upstream = _upstream(world_size) if _VLLM_CAR is not None else None
     # Every power of two across the range PLUS the bound and one element either side. Bounds alone
     # are the edges of the rule AS IT IS, so a wrong rule that diverges in the band between two of
     # them shows up on neither: a bounds-only grid missed a real bound at world 2 and 4.
@@ -439,25 +453,13 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
                 f"world={world_size} baseline={want}")
             assert ours.should_allgather(t) == want, (
                 f"all_gather admission diverged: {dtype} {nbytes}B world={world_size}")
-
-
-def test_the_transcribed_baseline_still_matches_vllms() -> None:
-    """The numbers above are a COPY, so this is what notices when the original moves.
-
-    Skipped when vLLM is not importable, which is the only reason the copy exists: the test above has
-    to hold with nothing but torch.
-    """
-    vllm_car = pytest.importorskip(
-        "vllm.distributed.device_communicators.custom_all_reduce",
-        reason="vLLM not installed; the transcribed numbers cannot be cross-checked here")
-    real = object.__new__(vllm_car.CustomAllreduce)
-    real.disabled, real.world_size, real.fully_connected = False, 8, True
-    real.max_size = BASELINE_MAX_SIZE
-    for nbytes in (16, 4096, 1 << 20, BASELINE_MAX_SIZE - 16, BASELINE_MAX_SIZE, 1 << 27):
-        t = torch.empty(nbytes // 2, dtype=torch.bfloat16)
-        assert real.should_custom_ar(t) == baseline_admits(nbytes), (
-            f"vLLM's should_custom_ar no longer matches the numbers transcribed here at {nbytes}B. "
-            f"Re-read it and update BASELINE_* plus `baseline_admits`.")
+            # And the transcription itself, whenever vLLM is here to be asked. Same assertion, not a
+            # second test: "ours is this rule" and "this rule is vLLM's" are one claim, and splitting
+            # them made the second read as a test of somebody else's code.
+            if upstream is not None:
+                assert upstream.should_custom_ar(t) == want, (
+                    f"vLLM's should_custom_ar no longer matches the numbers transcribed here at "
+                    f"{nbytes}B -- re-read it and update BASELINE_* and `baseline_admits`.")
 
 
 @pytest.mark.parametrize("mode", MODES)
