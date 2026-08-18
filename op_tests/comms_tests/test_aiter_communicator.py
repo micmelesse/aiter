@@ -41,7 +41,9 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
 )
 from aiter.dist.utils import get_distributed_init_method, get_open_port
+from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 from aiter.ops.triton.comms.communicator import (
+    _DEFAULT_MAX_SIZE,
     HipCommunicator,
     IrisCommunicator,
     TorchCommunicator,
@@ -572,6 +574,44 @@ def parse(argv: Optional[Sequence[str]] = None) -> Plan:
     )
 
 
+def admission_divergences(world: int) -> List[str]:
+    """Where our backends admit a different set than `CustomAllreduce`, which they replace.
+
+    THE precondition for the run meaning anything: if an arm takes a tensor the baseline declines,
+    the arms route different work and the numbers compare routing rather than kernels. Both
+    predicates read only tensor metadata plus a few attributes, so no GPU and no process group --
+    `object.__new__` is enough, and CPU tensors are enough.
+
+    fp32 is expected to diverge and is not reported: `hip_comms.cu` has fp16 and bf16 instantiations
+    only, so closing that needs a kernel, not a predicate.
+    """
+    def _attrs(obj, **kw):
+        for k, v in kw.items():
+            setattr(obj, k, v)
+        return obj
+
+    base = _attrs(object.__new__(CustomAllreduce), disabled=False, world_size=world,
+                  fully_connected=True, max_size=_DEFAULT_MAX_SIZE)
+    ours = _attrs(object.__new__(TorchCommunicator), disabled=False, world_size=world,
+                  max_size=_DEFAULT_MAX_SIZE)
+    # ON the boundaries and one element either side, where an off-by-one hides.
+    edges = (16, 512, 1 << 20, _DEFAULT_MAX_SIZE // (world * 2), _DEFAULT_MAX_SIZE, 8192 * 8192)
+    out: List[str] = []
+    for dtype in (torch.float16, torch.bfloat16):
+        es = torch.empty(0, dtype=dtype).element_size()
+        for nbytes in sorted({e + d for e in edges for d in (-es, 0, es) if e + d > 0}):
+            if nbytes % es:
+                continue
+            t = torch.empty(nbytes // es, dtype=dtype)
+            for op, want, got in (
+                ("all_reduce", base.should_custom_ar(t), ours.should_allreduce(t)),
+                ("all_gather", base.should_custom_ag(t), ours.should_allgather(t)),
+            ):
+                if want != got:
+                    out.append(f"{op} {dtype} {nbytes}B: baseline={want} ours={got}")
+    return out
+
+
 def run(plan: Plan) -> Report:
     """RUN: a Plan in -> a Report out. Everything that touches the code under test lives here.
 
@@ -584,6 +624,13 @@ def run(plan: Plan) -> Report:
         print(f"  {i:3}  {case}")
     if plan.list_only:
         return Report(())
+
+    # Refuse to measure arms that do not take the same work. This is a correctness gate on the
+    # EXPERIMENT rather than on a backend, so it runs before any case and stops the run.
+    if diverged := admission_divergences(plan.world):
+        raise SystemExit(
+            "admission no longer matches CustomAllreduce, so the arms would route different work "
+            "and these numbers would compare routing:\n  " + "\n  ".join(diverged))
 
     outcomes: List[Outcome] = []
     for i, case in enumerate(plan.cases, 1):
