@@ -15,12 +15,9 @@ from . import hip_comms
 
 logger = logging.getLogger(__name__)
 
-# Both taken from `CustomAllreduce`, because these backends replace it and an envelope that differs
-# changes which tensors take the fast path. `max_size` is the declared message budget (it drives the
-# all_gather bound); `_AR_MAX_BYTES` is the decode all-reduce ceiling, which baseline hardcodes
-# independently of its own max_size -- conflating the two is what made ours 8x too tight there.
+# vLLM's CustomAllreduce default, and the only bound its admission uses. That class is what these
+# backends replace, so the envelope is transcribed from it rather than invented.
 _DEFAULT_MAX_SIZE = 8 * 1024 * 1024
-_AR_MAX_BYTES = 8192 * 8192
 
 
 def _iris_available() -> bool:
@@ -69,7 +66,7 @@ class Communicator(ABC):
 
     # Checked when the class is DEFINED, the earliest moment there is.
     _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture",
-                        "_shaped_for_a_kernel")
+                        "_admits")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -85,33 +82,27 @@ class Communicator(ABC):
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         """Whether this backend will take `inp`. Public because a False means the caller falls back."""
-        return (
-            not self.disabled
-            and self._shaped_for_a_kernel(inp)
-            and inp.numel() * inp.element_size() <= _AR_MAX_BYTES
-        )
+        return not self.disabled and self._admits(inp)
 
     def should_allgather(self, inp: torch.Tensor) -> bool:
-        """`CustomAllreduce.should_custom_ag`'s bound: the output is world_size x the input, so the
-        per-rank input has to fit a fraction of the budget."""
-        return (
-            not self.disabled
-            and self._shaped_for_a_kernel(inp)
-            and inp.numel() * inp.element_size() <= self.max_size / (self.world_size * 2)
-        )
+        return not self.disabled and self._admits(inp)
 
-    def _shaped_for_a_kernel(self, inp: torch.Tensor) -> bool:
-        """What both ops need, for every backend: a contiguous, 16-byte-aligned run of bytes in a
-        dtype the kernels are instantiated for.
+    def _admits(self, inp: torch.Tensor) -> bool:
+        """THE envelope, identical for every backend and both ops.
 
-        Same rules as `CustomAllreduce.should_custom_ar`, the path these backends replace: a different
-        envelope changes which tensors take the fast path and makes the arms incomparable. DTYPE is the
-        one divergence left -- baseline does not check it, our kernels exist only for fp16 and bf16 --
-        and `test_admission_matches_baseline.py` is what holds the rest identical."""
+        Transcribed from `vllm.distributed.device_communicators.custom_all_reduce.should_custom_ar`,
+        the path these backends replace: a 16-byte multiple, weak-contiguous, under `max_size`.
+        Admitting a different set would change which tensors take the fast path. DTYPE is the one
+        addition -- our kernels are instantiated for fp16 and bf16 only.
+
+        The bound is the INPUT's, which is what our buffers hold: hip stages the input in a `max_size`
+        buffer, and iris's per-rank gather slab is larger still.
+        """
         nbytes = inp.numel() * inp.element_size()
         return (
             _is_weak_contiguous(inp)
             and nbytes % 16 == 0
+            and nbytes < self.max_size
             and inp.dtype in self._SUPPORTED_DTYPES
         )
 
@@ -242,7 +233,7 @@ class IrisCommunicator(Communicator):
 
         # The heap and the slab are limits on the CONFIGURATION, not on a tensor: if `max_size` fits
         # inside both, no admitted input can exceed either, so nothing needs re-checking per call.
-        if _AR_MAX_BYTES * 2 > self._HEAP_SIZE or max_size / (world_size * 2) > self._AG_SLAB_SIZE:
+        if max_size * 2 > self._HEAP_SIZE or max_size > self._AG_SLAB_SIZE:
             logger.warning(
                 "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back the admitted bounds",
                 self._HEAP_SIZE >> 30, self._AG_SLAB_SIZE >> 20,
@@ -464,10 +455,8 @@ class HipCommunicator(Communicator):
         # same arch, same world size -- but if they ever were not, the ranks that got here
         # would HANG waiting for the ones that returned, rather than failing. Worth
         # knowing because a deadlock is far worse than an error.
-        # The staging buffer backs the EAGER path, so it has to hold the largest input we admit --
-        # the ceiling, not the message budget. They were the same number, which is what capped
-        # all_reduce at 8 MiB.
-        self._comms = hip_comms.HipComms(cpu_group, self.device, max_size=_AR_MAX_BYTES)
+        # The staging buffer backs the EAGER path and holds the largest input we admit.
+        self._comms = hip_comms.HipComms(cpu_group, self.device, max_size=self.max_size)
         self.disabled = False
         logger.info(
             "HipCommunicator ready: world_size=%d max_size=%dMB",

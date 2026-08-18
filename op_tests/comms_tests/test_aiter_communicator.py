@@ -40,9 +40,7 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
 )
 from aiter.dist.utils import get_distributed_init_method, get_open_port
-from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 from aiter.ops.triton.comms.communicator import (
-    _DEFAULT_MAX_SIZE,
     HipCommunicator,
     IrisCommunicator,
     TorchCommunicator,
@@ -387,42 +385,79 @@ def rendezvous() -> Tuple[str, int]:
     return "127.0.0.1", get_open_port()
 
 
+# vLLM's CustomAllreduce admission, TRANSCRIBED rather than imported. It is the path these backends
+# replace, so it is the envelope they have to match -- and writing the rule down is what makes the
+# match reviewable. Two reasons not to import it:
+#
+#   * aiter vendors its OWN modified copy (`aiter/dist/device_communicators/custom_all_reduce.py`).
+#     That fork hardcodes `fully_connected = True`, splits the size bound into decode/prefill with an
+#     `8192*8192` constant, and adds a `should_custom_ag` that upstream does not have at all. Testing
+#     against it pins us to a fork the experiment's baseline arm does not run.
+#   * an import makes the assertion invisible: the test would pass by construction whatever either
+#     file said, and a change upstream would silently change what we claim to guarantee.
+#
+# Upstream, vllm/distributed/device_communicators/custom_all_reduce.py:
+#     if self.disabled: return False
+#     if inp_size % 16 != 0: return False
+#     if not is_weak_contiguous(inp): return False
+#     if self.world_size == 2 or self.fully_connected: return inp_size < self.max_size
+#     return False
+BASELINE_MAX_SIZE = 8 * 1024 * 1024      # CustomAllreduce's default max_size
+BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 16"
+
+
+def baseline_admits(nbytes: int) -> bool:
+    """`should_custom_ar` for a contiguous input on a fully-connected box, from the numbers above."""
+    return nbytes % BASELINE_ALIGNMENT == 0 and nbytes < BASELINE_MAX_SIZE
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_admission_matches_the_baseline(world_size: int) -> None:
-    """Every backend admits exactly what `CustomAllreduce` does, which is the path they replace.
+    """Every backend admits exactly what vLLM's CustomAllreduce does.
 
-    THE precondition for the matrix below meaning anything: if an arm takes a tensor the baseline
-    declines, the arms route different work and the numbers compare routing, not kernels.
+    THE precondition for the matrix meaning anything: if an arm takes a tensor the baseline declines,
+    the arms route different work and the numbers compare routing, not kernels.
 
-    Needs no GPU -- both predicates read only tensor metadata plus a few attributes -- so it holds
-    even where the matrix cannot run. fp32 is excluded and expected to diverge: `hip_comms.cu` has
-    fp16 and bf16 instantiations only, so closing that needs a kernel, not a predicate.
+    Needs no GPU, so it holds even where the matrix cannot run. fp32 is excluded and expected to
+    diverge -- `hip_comms.cu` has fp16 and bf16 instantiations only, so closing that needs a kernel.
     """
-    def _as(cls, **kw):
-        obj = object.__new__(cls)
-        for k, v in kw.items():
-            setattr(obj, k, v)
-        return obj
-
-    base = _as(CustomAllreduce, disabled=False, world_size=world_size, fully_connected=True,
-               max_size=_DEFAULT_MAX_SIZE)
-    ours = _as(TorchCommunicator, disabled=False, world_size=world_size, max_size=_DEFAULT_MAX_SIZE)
-    # Every power of two across the range PLUS the current bounds and one element either side.
-    # Bounds alone are the edges of the rules AS THEY ARE, so a wrong rule that diverges in the band
-    # between two of them shows up on neither -- measured: the bound we shipped went unseen at
-    # world 2 and 4 under a bounds-only grid.
-    edges = tuple(1 << k for k in range(4, 28)) + (
-        _DEFAULT_MAX_SIZE // (world_size * 2), _DEFAULT_MAX_SIZE, 8192 * 8192)
+    ours = object.__new__(TorchCommunicator)
+    ours.disabled, ours.world_size, ours.max_size = False, world_size, BASELINE_MAX_SIZE
+    # Every power of two across the range PLUS the bound and one element either side. Bounds alone
+    # are the edges of the rule AS IT IS, so a wrong rule that diverges in the band between two of
+    # them shows up on neither: a bounds-only grid missed a real bound at world 2 and 4.
+    edges = tuple(1 << k for k in range(4, 28)) + (BASELINE_MAX_SIZE,)
     for dtype in (torch.float16, torch.bfloat16):
         es = torch.empty(0, dtype=dtype).element_size()
         for nbytes in sorted({e + d for e in edges for d in (-es, 0, es) if e + d > 0}):
             if nbytes % es:
                 continue
             t = torch.empty(nbytes // es, dtype=dtype)
-            assert base.should_custom_ar(t) == ours.should_allreduce(t), (
-                f"all_reduce admission diverged: {dtype} {nbytes}B world={world_size}")
-            assert base.should_custom_ag(t) == ours.should_allgather(t), (
+            want = baseline_admits(nbytes)
+            assert ours.should_allreduce(t) == want, (
+                f"all_reduce admission diverged from CustomAllreduce: {dtype} {nbytes}B "
+                f"world={world_size} baseline={want}")
+            assert ours.should_allgather(t) == want, (
                 f"all_gather admission diverged: {dtype} {nbytes}B world={world_size}")
+
+
+def test_the_transcribed_baseline_still_matches_vllms() -> None:
+    """The numbers above are a COPY, so this is what notices when the original moves.
+
+    Skipped when vLLM is not importable, which is the only reason the copy exists: the test above has
+    to hold with nothing but torch.
+    """
+    vllm_car = pytest.importorskip(
+        "vllm.distributed.device_communicators.custom_all_reduce",
+        reason="vLLM not installed; the transcribed numbers cannot be cross-checked here")
+    real = object.__new__(vllm_car.CustomAllreduce)
+    real.disabled, real.world_size, real.fully_connected = False, 8, True
+    real.max_size = BASELINE_MAX_SIZE
+    for nbytes in (16, 4096, 1 << 20, BASELINE_MAX_SIZE - 16, BASELINE_MAX_SIZE, 1 << 27):
+        t = torch.empty(nbytes // 2, dtype=torch.bfloat16)
+        assert real.should_custom_ar(t) == baseline_admits(nbytes), (
+            f"vLLM's should_custom_ar no longer matches the numbers transcribed here at {nbytes}B. "
+            f"Re-read it and update BASELINE_* plus `baseline_admits`.")
 
 
 @pytest.mark.parametrize("mode", MODES)
