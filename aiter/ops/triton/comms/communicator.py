@@ -35,6 +35,24 @@ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     )
 
 
+def _fits_a_kernel_buffer(inp: torch.Tensor, *, max_size: int, dtypes: list) -> bool:
+    """Whether a KERNEL over a fixed staging buffer can take `inp`: a contiguous run of bytes,
+    16-byte aligned for vector loads, inside the buffer, in a dtype the instantiations cover.
+
+    A function rather than a base class, because these are four facts about a TENSOR and a buffer --
+    not a kind of communicator. iris and hip each carried all four inline under a comment saying the
+    two MUST agree ("two backends that accept different tensors are not comparable, and the whole
+    reason this one exists is to be measured against that one"), and a rule enforced by a comment is
+    one edit from being false. One definition, called from each; torch calls it from nowhere, because
+    NCCL has none of these limits and saying so by inheriting from a different place would put the
+    three backends at two depths for a difference that is about data.
+    """
+    if not _is_weak_contiguous(inp):
+        return False
+    nbytes = inp.numel() * inp.element_size()
+    return nbytes % 16 == 0 and nbytes < max_size and inp.dtype in dtypes
+
+
 def _rocm_arch_available() -> bool:
     try:
         props = torch.cuda.get_device_properties(0)
@@ -156,8 +174,9 @@ class Communicator(ABC):
         """The per-rank inputs concatenated along `dim`, rank-ordered."""
 
     def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        """Constraints beyond `disabled`. Default NONE, which is the honest answer for a backend
-        with no hardware limits; `KernelCommunicator` supplies the ones a kernel has."""
+        """Constraints beyond `disabled`. Default NONE, the honest answer for a backend with no
+        hardware limits -- torch. A kernel backend answers with `_fits_a_kernel_buffer` plus whatever
+        only it needs; the all_gather hook is separate because the two ops genuinely disagree."""
         return True
 
     def _admits_all_gather(self, inp: torch.Tensor) -> bool:
@@ -170,41 +189,7 @@ class Communicator(ABC):
         return nullcontext()
 
 
-class KernelCommunicator(Communicator):
-    """A `Communicator` whose collectives are a KERNEL, with the admission rules that implies.
-
-    It exists because `IrisCommunicator` and `HipCommunicator` carried these five checks as two
-    near-identical functions, under a comment saying the two MUST agree ("two backends that accept
-    different tensors are not comparable, and the whole reason this one exists is to be measured
-    against that one"). A rule that must hold in two places, enforced by a comment, is one edit away
-    from being false -- so it holds in one place now and the requirement is the class hierarchy.
-
-    ALL_REDUCE ONLY. The all_gather rules are NOT shared, and writing this made that visible: iris
-    refuses by slab size and ignores dtype and contiguity, hip refuses by dtype and contiguity and
-    ignores size. So each backend still answers `_admits_all_gather` for itself, and the fact that
-    they disagree is now a difference you can see rather than one hidden in two similar functions.
-    (Flagged 2026-08-18: at (4, 8192) bf16 both admit, so it has never bitten.)
-    """
-
-    max_size: int
-    _SUPPORTED_DTYPES: list
-
-    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        """What ANY kernel over a fixed staging buffer needs: a contiguous run of bytes, 16-byte
-        aligned for vector loads, inside the buffer, in a dtype the instantiations cover."""
-        if not _is_weak_contiguous(inp):
-            return False
-        inp_size = inp.numel() * inp.element_size()
-        if inp_size % 16 != 0:
-            return False
-        if inp_size >= self.max_size:
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
-            return False
-        return True
-
-
-class IrisCommunicator(KernelCommunicator):
+class IrisCommunicator(Communicator):
     """Communicator using Iris CCL GPU-initiated communication.
 
     API mirrors CustomAllreduce: __init__(cpu_group, device_group, device,
@@ -283,11 +268,11 @@ class IrisCommunicator(KernelCommunicator):
     def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
         # The shared kernel rules, plus the two facts only iris has: a live symmetric heap, and
         # input+output having to fit in it.
-        if self._shmem is None:
-            return False
-        if not super()._admits_all_reduce(inp):
-            return False
-        return inp.numel() * inp.element_size() * 2 <= self._HEAP_SIZE
+        return (
+            self._shmem is not None
+            and _fits_a_kernel_buffer(inp, max_size=self.max_size, dtypes=self._SUPPORTED_DTYPES)
+            and inp.numel() * inp.element_size() * 2 <= self._HEAP_SIZE
+        )
 
     def _get_buffers(self, shape, dtype):
         if self._buf_shape != shape or self._buf_dtype != dtype:
@@ -467,7 +452,7 @@ class TorchCommunicator(Communicator):
 
 
 
-class HipCommunicator(KernelCommunicator):
+class HipCommunicator(Communicator):
     """Communicator backed by HIP collectives we own (`hip_comms.cu` in this directory).
 
     The point of this backend is CONTROL, not (yet) speed. The iris backend's
@@ -551,14 +536,14 @@ class HipCommunicator(KernelCommunicator):
         )
 
     def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
-        # The shared kernel rules come from `KernelCommunicator`, which is what now GUARANTEES the
-        # thing this comment used to ask for -- that iris and hip admit the same tensors, since two
-        # backends accepting different inputs are not comparable and comparison is why hip exists.
-        if not super()._admits_all_reduce(inp):
-            return False
-        # A two-stage reduce-scatter splits the buffer across ranks, so a count
+        # ONE definition of the shared rules, called from here and from iris -- which is what makes
+        # the two comparable, the property that comment used to only ask for.
+        # The extra is ours: a two-stage reduce-scatter splits the buffer across ranks, so a count
         # that does not divide is a correctness hazard rather than a slow path.
-        return inp.numel() % self.world_size == 0
+        return (
+            _fits_a_kernel_buffer(inp, max_size=self.max_size, dtypes=self._SUPPORTED_DTYPES)
+            and inp.numel() % self.world_size == 0
+        )
 
     def _admits_all_gather(self, inp: torch.Tensor) -> bool:
         # NOT the shared all_reduce rules: a gather has no staging buffer to overflow, so size does
