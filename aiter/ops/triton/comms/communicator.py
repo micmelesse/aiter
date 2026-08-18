@@ -65,7 +65,7 @@ class Communicator(ABC):
 
     # Checked when the class is DEFINED, the earliest moment there is.
     _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture",
-                        "_admits")
+                        "_shaped_for_a_kernel")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -81,26 +81,38 @@ class Communicator(ABC):
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         """Whether this backend will take `inp`. Public because a False means the caller falls back."""
-        return not self.disabled and self._admits(inp)
+        return (
+            not self.disabled
+            and self._shaped_for_a_kernel(inp)
+            and inp.numel() * inp.element_size() < self.max_size
+        )
 
     def should_allgather(self, inp: torch.Tensor) -> bool:
-        return not self.disabled and self._admits(inp)
+        """Tighter than all_reduce, and deliberately the same formula `CustomAllreduce.should_custom_ag`
+        uses: the output is world_size x the input, so the per-rank input has to fit a fraction of the
+        buffer. Ours was bounded by `max_size` like all_reduce, which at TP=8 admitted 16x what the
+        path we replace does -- so a gather it hands to NCCL we would have taken, and the difference
+        would have read as a kernel result."""
+        return (
+            not self.disabled
+            and self._shaped_for_a_kernel(inp)
+            and inp.numel() * inp.element_size() <= self.max_size / (self.world_size * 2)
+        )
 
-    def _admits(self, inp: torch.Tensor) -> bool:
-        """THE envelope, identical for every backend and every op, so the three arms do the same work
-        and differ only in the code that runs: a contiguous, 16-byte-aligned run of bytes under
-        `max_size`, in a covered dtype, with a count the ranks divide evenly.
+    def _shaped_for_a_kernel(self, inp: torch.Tensor) -> bool:
+        """What both ops need, for every backend: a contiguous, 16-byte-aligned run of bytes in a
+        dtype the kernels are instantiated for.
 
-        No backend hook. A per-backend rule would mean an input one arm runs and another declines,
-        which makes the arms incomparable -- and whether a given tensor is in scope is a question
-        about the CONFIGURATION, answered once at construction by `disabled`."""
+        Same rules as `CustomAllreduce.should_custom_ar`, which is the path these backends replace --
+        admitting a different set would change which tensors take the fast path and make the arms
+        incomparable with the baseline. The one deliberate difference is DTYPE: the baseline does not
+        check it, our kernels exist only for fp16 and bf16, so an fp32 all-reduce falls back for us and
+        does not for it."""
         nbytes = inp.numel() * inp.element_size()
         return (
             _is_weak_contiguous(inp)
             and nbytes % 16 == 0
-            and nbytes < self.max_size
             and inp.dtype in self._SUPPORTED_DTYPES
-            and inp.numel() % self.world_size == 0
         )
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
@@ -460,8 +472,9 @@ class HipCommunicator(Communicator):
             self.max_size >> 20,
         )
 
-    # No admission of its own: the count-divides-the-ranks rule a two-stage reduce-scatter needs is
-    # in the shared envelope, so every arm refuses the same shapes.
+    # No admission of its own. A two-stage reduce-scatter will need the count to divide the ranks;
+    # the shipped kernel is one-shot and does not, and the baseline does not check it either, so
+    # adding it would refuse tensors both we and the path we replace can handle.
 
 
     def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
