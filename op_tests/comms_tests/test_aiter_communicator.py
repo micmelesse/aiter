@@ -360,30 +360,6 @@ def tolerance(op_name, dtype):
     return 0.1 if dtype == torch.bfloat16 else 0.01
 
 
-CASE_TIMEOUT_S = 600
-
-
-def _collect(pool, rets):
-    """Every rank's result, or raise `mp.TimeoutError` once `CASE_TIMEOUT_S` is up.
-
-    THE reason this exists rather than `pool.join()`: join waits forever. On 2026-08-18 all eight
-    ranks deadlocked inside `destroy_process_group` and the driver sat in join with nothing printed
-    for eight minutes. `AsyncResult.get(timeout=...)` is what makes a hang a reportable outcome, and
-    `terminate()` is what stops the ranks so the next case can have the GPUs.
-    """
-    deadline = time.monotonic() + CASE_TIMEOUT_S
-    out = []
-    try:
-        for r in rets:
-            out.append(r.get(timeout=max(1.0, deadline - time.monotonic())))
-    except mp.TimeoutError:
-        pool.terminate()
-        pool.join()
-        raise
-    pool.join()
-    return out
-
-
 def _judge(op_name, dtype, all_inputs, got):
     """Every replay against its OWN reference. Pure. Returns (ok, worst_diff, worst_at, atol).
 
@@ -495,82 +471,104 @@ def _detail(o: Outcome) -> str:
     return f"worst|diff|={m.worst_diff:.3g} atol={m.atol}{at}"
 
 
-def render(outcomes: Sequence[Outcome]) -> str:
-    """The summary, as the deliverable: one line per case, in the order they ran. PURE."""
-    return "\n".join(["", "==== correctness summary ===="]
-                     + [f"  [{o.label:5}] {o.case}  {_detail(o)}" for o in outcomes])
+@dataclass(frozen=True)
+class Report:
+    """A finished run: what every case did, plus the ONE conclusion drawn from them.
 
-
-def verdict_of_run(outcomes: Sequence[Outcome], control: str = "torch") -> Optional[str]:
-    """The run's single conclusion, or None if everything passed. PURE.
-
-    CONTROL FIRST, and separately: `torch` is known-good, so it failing means the HARNESS is
-    unsound and every other line in the table is worthless. That is a different message from a
-    backend bug, and conflating the two once cost a day of chasing the wrong thing.
+    Essential, not an intermediate: `outcomes` alone does not say whether the run passed, because
+    that depends on WHICH case failed (a control failure invalidates the table; a backend failure
+    does not). The conclusion is the thing a reader wants and the thing the exit code encodes.
     """
-    bad = [o for o in outcomes if not o.ok]
-    ctrl = [o for o in bad if o.case.backend == control]
-    if ctrl:
-        return (f"CONTROL FAILED: {control} is wrong or hung under this harness "
-                f"({ctrl[0].case} -- {_detail(ctrl[0])}). The harness is unsound; no other "
-                f"verdict in the table can be trusted.")
-    if bad:
-        hung = [o for o in bad if o.hung]
-        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
-        return (f"{lead}{len(bad)} of {len(outcomes)} case(s) failed (control passed, so these are "
-                f"real backend bugs): "
-                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
-    return None
+
+    outcomes: Sequence[Outcome]
+    problem: Optional[str]          # None when everything required passed
+
+    @property
+    def exit_code(self) -> int:
+        return 1 if self.problem else 0
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Every input EXPLICIT, in one place: parse, build the matrix, run it, report, decide.
+def run(argv: Optional[Sequence[str]] = None) -> List[Outcome]:
+    """READ: argv and the world it names, in -> one Outcome per case, out.
 
-    The five steps are the whole program and they are visible in order. This replaced a 107-line
-    `__main__` block that inlined two five-deep loop nests, its own progress counters, its own
-    summary formatting and its own verdict logic -- so the matrix, the running and the judging
-    could not be read or changed independently.
+    Everything that touches the outside lives here: the flags, the GPUs, the spawned ranks. It
+    prints per-case progress as it goes, which is emission inside the read phase and deliberate --
+    a case that hangs must have named itself BEFORE it hung, or the log cannot say which one did.
     """
-    freeze_support()
     args = parser.parse_args(argv)
 
-    # Cheap and first: no GPU, no process group. A silently wrong backend does not crash, it
-    # returns numbers for something you did not ask for.
+    # Cheap and first, before any GPU: a silently wrong backend does not crash, it returns numbers
+    # for something you did not ask for.
     check_backend_selection()
 
     backends = _pick(args.backend, BACKENDS, "backend")
     modes = _pick(args.mode, MODES, "mode")
-    dts = ([dtypes.d_dtypes[args.dtype]] if args.dtype
-           else [dtypes.d_dtypes[k] for k in l_dtype])
+    dts = [dtypes.d_dtypes[args.dtype]] if args.dtype else [dtypes.d_dtypes[k] for k in l_dtype]
     shapes = [args.shape] if args.shape else list(l_shape)
-
     plan = cases(backends, OPS, dts, shapes, modes)
-    print(f"world={args.world}  rendezvous={args.addr}:{args.port or 'free'}  "
-          f"backends={backends}  modes={list(modes)}  "
-          f"dtypes={[str(d) for d in dts]}  shapes={shapes}")
-    print(f"{len(plan)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
 
+    print(f"world={args.world}  rendezvous={args.addr}:{args.port or 'free'}  "
+          f"backends={backends}  modes={list(modes)}  dtypes={[str(d) for d in dts]}  "
+          f"shapes={shapes}")
+    print(f"{len(plan)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
     if args.list:
         for i, case in enumerate(plan, 1):
             print(f"  {i:3}  {case}")
-        return 0
+        return []
 
     outcomes: List[Outcome] = []
     for i, case in enumerate(plan, 1):
-        # Announce BEFORE running: a hang leaves this line as the last thing printed, which names
-        # the case that hung. Flushed, because a hung process never drains a buffer.
         print(f"[{i}/{len(plan)}] {case}", flush=True)
         o = run_case(case, world=args.world, addr=args.addr, port=args.port)
         print(f"      -> {o.label:5}  {_detail(o)}", flush=True)
         outcomes.append(o)
+    return outcomes
 
-    print(render(outcomes), flush=True)
-    problem = verdict_of_run(outcomes)
-    if problem:
-        print(f"\n{problem}", flush=True)
-        return 1
-    print(f"\nall {len(outcomes)} case(s) within tolerance", flush=True)
-    return 0
+
+def judge(outcomes: Sequence[Outcome], control: str = "torch") -> Report:
+    """COMPUTE: outcomes in -> the run's conclusion, out. Pure, total, no I/O.
+
+    CONTROL FIRST, and separately from everything else: `torch` is known-good, so it failing means
+    the HARNESS is unsound and every other line in the table is worthless. That is a different
+    message from a backend bug, and conflating the two once cost a day of chasing the wrong thing.
+    """
+    bad = [o for o in outcomes if not o.ok]
+    ctrl = [o for o in bad if o.case.backend == control]
+    if ctrl:
+        return Report(outcomes, f"CONTROL FAILED: {control} is wrong or hung under this harness "
+                                f"({ctrl[0].case} -- {_detail(ctrl[0])}). The harness is unsound; "
+                                f"no other verdict in the table can be trusted.")
+    if bad:
+        hung = [o for o in bad if o.hung]
+        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
+        return Report(outcomes, f"{lead}{len(bad)} of {len(outcomes)} case(s) failed (control "
+                                f"passed, so these are real backend bugs): "
+                                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
+    return Report(outcomes, None)
+
+
+def emit(report: Report) -> int:
+    """EMIT: a Report in -> the summary printed and an exit code out. The only writer."""
+    if report.outcomes:
+        print("\n==== correctness summary ====")
+        for o in report.outcomes:
+            print(f"  [{o.label:5}] {o.case}  {_detail(o)}")
+    if report.problem:
+        print(f"\n{report.problem}", flush=True)
+    elif report.outcomes:
+        print(f"\nall {len(report.outcomes)} case(s) within tolerance", flush=True)
+    return report.exit_code
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """READ, then COMPUTE, then EMIT -- and nothing else, so the whole program is one line.
+
+    The phases are the shape, not a description of it (CONTRIBUTING *In code we own but SHIP
+    elsewhere*). This replaced a 107-line `__main__` block that inlined two five-deep loop nests,
+    its own progress counters, its own summary formatting and its own verdict logic, so none of the
+    three could be read or changed independently.
+    """
+    return emit(judge(run(argv)))
 
 
 def _pick(raw: Optional[str], known: Sequence[str], what: str) -> List[str]:
