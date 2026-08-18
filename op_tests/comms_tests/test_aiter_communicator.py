@@ -398,14 +398,24 @@ def _replay_input(rank, k, shape, dtype):
     return torch.randn(shape, generator=g).to(dtype)
 
 
-def _run_eager(op, inputs, static_in):
-    """Call the collective once. Returns one output per input, so eager is the 1-replay case."""
+def _run_eager(comm, op, inputs, static_in):
+    """Call the collective once. Returns one output per input, so eager is the 1-replay case.
+
+    `comm` is unused, and taken anyway so both runners have ONE signature: the mode is chosen by
+    assigning a runner, and two shapes would make that assignment carry a per-mode argument list."""
     static_in.copy_(inputs[0])
     return [op().clone()]
 
 
-def _run_graph(op, inputs, static_in):
+def _run_graph(comm, op, inputs, static_in):
     """Capture once, then replay with a FRESH input each time. One output per replay.
+
+    The capture is wrapped in `comm.capture()`, which is part of the Communicator interface and is
+    NOT optional: a backend is told when it is being captured because a captured launch records an
+    address that is not yet valid. hip defers its peer-pointer registration and completes it on exit;
+    iris switches its barrier behaviour. Omitting it faulted all 8 ranks on a null peer pointer
+    (`Memory access fault ... on address 0x2000`) and made iris's graph results meaningless -- and the
+    torch CONTROL could not catch either, because its `capture()` is a bare `yield`. See LOG 2026-08-18.
 
     The graph is a LOCAL, so it is freed when this returns -- which must happen BEFORE the process
     group is destroyed. A live captured graph holds the communicator's work, and
@@ -419,7 +429,7 @@ def _run_graph(op, inputs, static_in):
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with comm.capture(), torch.cuda.graph(graph):
         out = op()
     snaps = torch.empty((len(inputs), *out.shape), dtype=out.dtype, device=out.device)
     for k, x in enumerate(inputs):
@@ -502,7 +512,7 @@ def run_rank(rank, world, pp, case, init_method):
     op = _make_op(comm, case.op, static_in)
 
     runner = _run_graph if case.mode == "graph" else _run_eager
-    verdict = _judge(case.op, case.dtype, all_inputs, runner(op, mine, static_in))
+    verdict = _judge(case.op, case.dtype, all_inputs, runner(comm, op, mine, static_in))
 
     # The ONE teardown in the file. Anything holding graph-pool memory goes first; the graph itself
     # is already freed by `_run_graph` having returned.

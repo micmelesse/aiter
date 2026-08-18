@@ -4,7 +4,7 @@
 import logging
 import os
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Iterator, Optional, Union
 
 import torch
@@ -55,27 +55,156 @@ class Communicator(ABC):
     CudaCommunicator calls: a ``disabled`` flag, the should_*/all_* pairs
     (collectives are out-of-place — input untouched, new tensor returned), and a
     capture() context entered around cudagraph capture.
+
+    THE SEQUENCE OF A CALL IS DECIDED HERE, once, and a backend supplies only the pieces it is
+    asked for. It used to be five abstract methods, so every rule about HOW to call a collective was
+    a rule the caller had to remember, and each one failed in a different register: skipping
+    `capture()` was silent for torch, dead for iris and a GPU memory fault for hip; calling
+    `all_reduce` without asking `should_allreduce` was checked by nobody at all. Now the caller
+    cannot skip a step, because the step is not theirs to take. (LOG 2026-08-18.)
     """
 
     disabled: bool
 
-    @abstractmethod
-    def should_allreduce(self, inp: torch.Tensor) -> bool: ...
+    # A CLASS attribute, so a backend needs no cooperating `__init__` to get the invariant.
+    _capturing: bool = False
+
+    # The sequence is not a suggestion: a backend that re-decides it silently gets its own rules back,
+    # which is the state this class was built to leave. Checked when the class is DEFINED -- the
+    # earliest moment available, before any run, any GPU, and any test.
+    _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        taken = [n for n in Communicator._CALLERS_SURFACE if n in cls.__dict__]
+        if taken:
+            raise TypeError(
+                f"{cls.__name__} overrides {taken}, which `Communicator` owns. Supply the pieces "
+                f"instead: `_all_reduce`, `_all_gather`, `_admits_all_reduce`, `_admits_all_gather`, "
+                f"`_on_capture`. The base enforces the capture invariant and the admission gate for "
+                f"every backend, and an override skips both."
+            )
+
+    # ---- What the CALLER uses. Concrete: this class owns the order. ----
+
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
+        """Whether this backend will take `inp`. The caller's question, because a caller that gets
+        False has to do something else -- vLLM falls back to another all-reduce path."""
+        return not self.disabled and self._admits_all_reduce(inp)
+
+    def should_allgather(self, inp: torch.Tensor) -> bool:
+        return not self.disabled and self._admits_all_gather(inp)
+
+    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        self._check_capture("all_reduce")
+        if not self.should_allreduce(inp):
+            raise RuntimeError(self._rejected("all_reduce", inp))
+        return self._all_reduce(inp)
+
+    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        self._check_capture("all_gather")
+        if not self.should_allgather(inp):
+            raise RuntimeError(self._rejected("all_gather", inp))
+        return self._all_gather(inp, dim)
+
+    @contextmanager
+    def capture(self) -> Iterator[None]:
+        """Enter around a cudagraph capture. NOT optional, and now not skippable in silence: a
+        captured launch records an address that is not valid yet, so a backend has to be told.
+
+        The flag is kept here rather than by each backend because it is what makes the omission
+        detectable -- see `_check_capture`."""
+        self._capturing = True
+        try:
+            with self._on_capture():
+                yield
+        finally:
+            self._capturing = False
+
+    # ---- The two rules a caller can get wrong, enforced once. ----
+
+    def _check_capture(self, op: str) -> None:
+        """Refuse a collective recorded into a graph outside `capture()`.
+
+        Two facts observed independently: the stream says it is capturing, and this object says
+        nobody entered the context. They cannot both be right, and the caller is the one that can
+        be wrong. Raising HERE names the line; hip's version of getting this wrong was
+        `Memory access fault ... on address 0x2000` on all 8 ranks at replay, half an hour later,
+        with a null peer pointer as the only clue."""
+        if torch.cuda.is_current_stream_capturing() and not self._capturing:
+            raise RuntimeError(
+                f"{type(self).__name__}.{op} is being captured into a cudagraph, but "
+                f"`capture()` was never entered. Wrap the capture: "
+                f"`with comm.capture(), torch.cuda.graph(g): ...`. A backend defers work until that "
+                f"context exits (hip registers peer pointers there), so a graph captured without it "
+                f"replays against addresses that were never registered."
+            )
+
+    def _rejected(self, op: str, inp: torch.Tensor) -> str:
+        return (f"{type(self).__name__} rejected {op}: shape={tuple(inp.shape)} dtype={inp.dtype} "
+                f"disabled={self.disabled}. Ask should_{op.replace('_', '')} first and fall back "
+                f"when it says no.")
+
+    # ---- What a BACKEND supplies. ----
 
     @abstractmethod
-    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor: ...
+    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """SUM across ranks, out of place: input untouched, new tensor returned."""
 
     @abstractmethod
-    def should_allgather(self, inp: torch.Tensor) -> bool: ...
+    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
+        """The per-rank inputs concatenated along `dim`, rank-ordered."""
 
-    @abstractmethod
-    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor: ...
+    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
+        """Constraints beyond `disabled`. Default NONE, which is the honest answer for a backend
+        with no hardware limits; `KernelCommunicator` supplies the ones a kernel has."""
+        return True
 
-    @abstractmethod
-    def capture(self) -> AbstractContextManager[None]: ...
+    def _admits_all_gather(self, inp: torch.Tensor) -> bool:
+        return True
+
+    def _on_capture(self) -> AbstractContextManager[None]:
+        """What this backend must do around a capture. Default nothing, stated by supplying nothing
+        rather than by writing an empty override -- iris's empty override set a flag no line read,
+        and it was indistinguishable from a real one."""
+        return nullcontext()
 
 
-class IrisCommunicator(Communicator):
+class KernelCommunicator(Communicator):
+    """A `Communicator` whose collectives are a KERNEL, with the admission rules that implies.
+
+    It exists because `IrisCommunicator` and `HipCommunicator` carried these five checks as two
+    near-identical functions, under a comment saying the two MUST agree ("two backends that accept
+    different tensors are not comparable, and the whole reason this one exists is to be measured
+    against that one"). A rule that must hold in two places, enforced by a comment, is one edit away
+    from being false -- so it holds in one place now and the requirement is the class hierarchy.
+
+    ALL_REDUCE ONLY. The all_gather rules are NOT shared, and writing this made that visible: iris
+    refuses by slab size and ignores dtype and contiguity, hip refuses by dtype and contiguity and
+    ignores size. So each backend still answers `_admits_all_gather` for itself, and the fact that
+    they disagree is now a difference you can see rather than one hidden in two similar functions.
+    (Flagged 2026-08-18: at (4, 8192) bf16 both admit, so it has never bitten.)
+    """
+
+    max_size: int
+    _SUPPORTED_DTYPES: list
+
+    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
+        """What ANY kernel over a fixed staging buffer needs: a contiguous run of bytes, 16-byte
+        aligned for vector loads, inside the buffer, in a dtype the instantiations cover."""
+        if not _is_weak_contiguous(inp):
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size % 16 != 0:
+            return False
+        if inp_size >= self.max_size:
+            return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
+        return True
+
+
+class IrisCommunicator(KernelCommunicator):
     """Communicator using Iris CCL GPU-initiated communication.
 
     API mirrors CustomAllreduce: __init__(cpu_group, device_group, device,
@@ -101,7 +230,6 @@ class IrisCommunicator(Communicator):
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.max_size = max_size
-        self._IS_CAPTURING = False
         self._shmem = None
         self._workspace = None
         self._input_buf = None
@@ -152,21 +280,14 @@ class IrisCommunicator(Communicator):
             self.max_size >> 20,
         )
 
-    def should_allreduce(self, inp: torch.Tensor) -> bool:
-        if self.disabled or self._shmem is None:
+    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
+        # The shared kernel rules, plus the two facts only iris has: a live symmetric heap, and
+        # input+output having to fit in it.
+        if self._shmem is None:
             return False
-        if not _is_weak_contiguous(inp):
+        if not super()._admits_all_reduce(inp):
             return False
-        inp_size = inp.numel() * inp.element_size()
-        if inp_size % 16 != 0:
-            return False
-        if inp_size >= self.max_size:
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
-            return False
-        if inp_size * 2 > self._HEAP_SIZE:
-            return False
-        return True
+        return inp.numel() * inp.element_size() * 2 <= self._HEAP_SIZE
 
     def _get_buffers(self, shape, dtype):
         if self._buf_shape != shape or self._buf_dtype != dtype:
@@ -177,7 +298,7 @@ class IrisCommunicator(Communicator):
             self._workspace = None
         return self._input_buf
 
-    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         assert self._shmem is not None
         try:
             out = torch.empty_like(inp)
@@ -208,9 +329,9 @@ class IrisCommunicator(Communicator):
             )
             raise
 
-    def should_allgather(self, inp: torch.Tensor) -> bool:
+    def _admits_all_gather(self, inp: torch.Tensor) -> bool:
         """Replace every NCCL all_gather; only slab capacity falls back."""
-        if self.disabled or self._shmem is None:
+        if self._shmem is None:
             return False
         inp_size = inp.numel() * inp.element_size()
         if inp_size > self._AG_SLAB_SIZE:
@@ -238,7 +359,7 @@ class IrisCommunicator(Communicator):
         output_buf = self._ag_output_slab.view(dtype)[:, :numel]
         return input_buf, output_buf
 
-    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         assert self._shmem is not None
         try:
             if dim < 0:
@@ -277,13 +398,10 @@ class IrisCommunicator(Communicator):
             )
             raise
 
-    @contextmanager
-    def capture(self) -> Iterator[None]:
-        try:
-            self._IS_CAPTURING = True
-            yield
-        finally:
-            self._IS_CAPTURING = False
+    # No `_on_capture`: iris needs nothing around a capture, and now says so by supplying nothing.
+    # It used to override `capture()` to set `self._IS_CAPTURING`, which NO line in this file reads --
+    # copied from `custom_all_reduce.py`, where the flag does have readers. An override that does
+    # nothing was indistinguishable from hip's, which does the thing the whole hook exists for.
 
 
 class TorchCommunicator(Communicator):
@@ -322,18 +440,16 @@ class TorchCommunicator(Communicator):
         self.world_size = dist.get_world_size(device_group)
         self.disabled = False
 
-    def should_allreduce(self, inp: torch.Tensor) -> bool:
-        return not self.disabled
+    # No `_admits_*` and no `_on_capture`: torch.distributed has no size, alignment or dtype limit
+    # this needs to express, and its collectives need no capture handling. Both are stated by
+    # supplying nothing, which is why the base defaults are what they are.
 
-    def should_allgather(self, inp: torch.Tensor) -> bool:
-        return not self.disabled
-
-    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.clone()
         dist.all_reduce(out, group=self.device_group)  # SUM
         return out
 
-    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         if dim < 0:
             dim += inp.dim()
         input_size = inp.size()
@@ -349,13 +465,9 @@ class TorchCommunicator(Communicator):
             + input_size[dim + 1 :]
         )
 
-    @contextmanager
-    def capture(self) -> Iterator[None]:
-        # torch.distributed collectives need no special capture handling.
-        yield
 
 
-class HipCommunicator(Communicator):
+class HipCommunicator(KernelCommunicator):
     """Communicator backed by HIP collectives we own (`hip_comms.cu` in this directory).
 
     The point of this backend is CONTROL, not (yet) speed. The iris backend's
@@ -438,53 +550,39 @@ class HipCommunicator(Communicator):
             self.max_size >> 20,
         )
 
-    def should_allreduce(self, inp: torch.Tensor) -> bool:
-        # The SAME admission rules as IrisCommunicator, deliberately: two backends
-        # that accept different tensors are not comparable, and the whole reason
-        # this one exists is to be measured against that one.
-        if self.disabled:
-            return False
-        if not _is_weak_contiguous(inp):
-            return False
-        inp_size = inp.numel() * inp.element_size()
-        if inp_size % 16 != 0:
-            return False
-        if inp_size >= self.max_size:
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
+    def _admits_all_reduce(self, inp: torch.Tensor) -> bool:
+        # The shared kernel rules come from `KernelCommunicator`, which is what now GUARANTEES the
+        # thing this comment used to ask for -- that iris and hip admit the same tensors, since two
+        # backends accepting different inputs are not comparable and comparison is why hip exists.
+        if not super()._admits_all_reduce(inp):
             return False
         # A two-stage reduce-scatter splits the buffer across ranks, so a count
         # that does not divide is a correctness hazard rather than a slow path.
-        if inp.numel() % self.world_size != 0:
-            return False
-        return True
+        return inp.numel() % self.world_size == 0
 
-    def should_allgather(self, inp: torch.Tensor) -> bool:
-        if self.disabled:
-            return False
-        if not _is_weak_contiguous(inp):
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
-            return False
-        return True
+    def _admits_all_gather(self, inp: torch.Tensor) -> bool:
+        # NOT the shared all_reduce rules: a gather has no staging buffer to overflow, so size does
+        # not gate it. Deliberately different from iris, which gates on slab size and ignores these
+        # two -- see `KernelCommunicator`.
+        return _is_weak_contiguous(inp) and inp.dtype in self._SUPPORTED_DTYPES
 
-    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         """Sum `inp` across the TP ranks. The launch config is chosen in `hip_comms`."""
         out = torch.empty_like(inp)
         self._comms.all_reduce(out, inp)
         return out
 
-    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def _all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's `inp` along `dim`, rank-ordered."""
         return self._comms.all_gather(inp.contiguous(), dim)
 
-    @contextmanager
-    def capture(self) -> Iterator[None]:
-        # The whole reason this hook exists: a captured input's address is not registered
+    def _on_capture(self) -> AbstractContextManager[None]:
+        # The whole reason the hook exists: a captured input's address is not registered
         # when the launch is recorded, so the context reserves a slot during capture and
-        # exchanges the IPC handles for everything recorded on the way out.
-        with self._comms.capture():
-            yield
+        # exchanges the IPC handles for everything recorded on the way out. Skipping it left the
+        # peer-pointer slot null and faulted all 8 ranks at replay, which is what `_check_capture`
+        # now refuses up front.
+        return self._comms.capture()
 
 
 def make_communicator(
