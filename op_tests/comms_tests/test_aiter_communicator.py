@@ -60,6 +60,9 @@ set_start_method("spawn", force=True)
 # (N x out-shape) and a stale read shows within the first few differing replays anyway.
 GRAPH_REPLAYS = 200
 
+
+CASE_TIMEOUT_S = 600
+
 # Deterministic per-(rank, replay) seed base for the varying-input check.
 _INPUT_SEED = 20260615
 
@@ -117,6 +120,10 @@ CONTROL = BACKENDS[0]
 # broken" apart from "staleness between replays" -- and `Measurement.worst_at` already gives that:
 # diverging at replay 0 is capture, at replay 1+ is staleness. Same answer, half the matrix.
 MODES = ("eager", "graph")
+
+
+l_dtype = ["fp16", "bf16"]
+l_shape = [(4, 8192), (128, 8192), (256, 8192)]
 
 
 @dataclass(frozen=True)
@@ -191,6 +198,119 @@ class Outcome:
         return f"worst|diff|={m.worst_diff:.3g} atol={m.atol}{at}"
 
 
+@dataclass(frozen=True)
+class Plan:
+    """WHAT to run and HOW: the cases, plus the parameters every case shares.
+
+    The output of `parse` and the input to `run`, so "did these flags produce the cases I meant" is
+    answerable without a GPU.
+    """
+
+    cases: Sequence[Case]
+    world: int
+    addr: str
+    port: int                       # RESOLVED by `parse`, so no case reaches for one later
+    list_only: bool
+
+
+@dataclass(frozen=True)
+class Report:
+    """A finished run: what every case did, and what that means for the run as a whole."""
+
+    outcomes: Sequence[Outcome]
+
+    @property
+    def failures(self) -> List[Outcome]:
+        return [o for o in self.outcomes if not o.ok]
+
+    @property
+    def conclusion(self) -> Optional[str]:
+        """The run's ONE conclusion, or None if every case passed.
+
+        CONTROL FIRST and separately: the control backend is known-good, so it failing means the
+        HARNESS is unsound and every other line in the table is worthless -- a different message
+        from a backend bug.
+        """
+        bad = self.failures
+        if not bad:
+            return None
+        ctrl = [o for o in bad if o.case.backend == CONTROL]
+        if ctrl:
+            return (f"CONTROL FAILED: {CONTROL} is wrong or hung under this harness "
+                    f"({ctrl[0].case} -- {ctrl[0].message}). The harness is unsound; no other "
+                    f"verdict in the table can be trusted.")
+        hung = [o for o in bad if o.hung]
+        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
+        return (f"{lead}{len(bad)} of {len(self.outcomes)} case(s) failed (control passed, so "
+                f"these are real backend bugs): "
+                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
+
+    @property
+    def exit_code(self) -> int:
+        return 1 if self.conclusion else 0
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape. e.g. -s 128,8192",
+)
+parser.add_argument(
+    "--addr",
+    type=str,
+    default="127.0.0.1",
+    help="rendezvous address the ranks connect to (default: 127.0.0.1)",
+)
+parser.add_argument(
+    "--port",
+    type=int,
+    default=None,
+    help="rendezvous port. Omitted (the default) picks a FREE one per case, so two runs on a "
+         "shared box cannot collide. Pin it only to debug a specific rendezvous.",
+)
+parser.add_argument(
+    "-l",
+    "--list",
+    action="store_true",
+    help="print the matrix and exit, running nothing (what WILL run, before spending GPUs on it)",
+)
+parser.add_argument(
+    "-m",
+    "--mode",
+    type=str,
+    default=None,
+    help=f"comma-separated subset of {','.join(MODES)} (default: all)",
+)
+parser.add_argument(
+    "-w",
+    "--world",
+    type=int,
+    default=8,
+    help="ranks to run each case across (default: 8)",
+)
+parser.add_argument(
+    "-b",
+    "--backend",
+    type=str,
+    default=None,
+    help=f"comma-separated subset of {','.join(BACKENDS)} (default: all, in that order)",
+)
+
+
 def cases(backends: Sequence[str], ops: Sequence[str], dts: Sequence["torch.dtype"],
           shapes: Sequence[Tuple[int, ...]], modes: Sequence[str] = MODES) -> List[Case]:
     """THE matrix, and the only place its order is decided.
@@ -202,6 +322,18 @@ def cases(backends: Sequence[str], ops: Sequence[str], dts: Sequence["torch.dtyp
     """
     return [Case(b, op, dt, sh, m)
             for b in backends for op in ops for dt in dts for sh in shapes for m in modes]
+
+
+def _pick(raw: Optional[str], known: Sequence[str], what: str) -> List[str]:
+    """A comma-separated subset of `known`, in `known`'s order. Unknown names REFUSE rather than
+    silently narrowing the run to nothing."""
+    if not raw:
+        return list(known)
+    asked = [s.strip() for s in raw.split(",") if s.strip()]
+    unknown = [s for s in asked if s not in known]
+    if unknown:
+        raise SystemExit(f"unknown {what}(s) {unknown}; known: {list(known)}")
+    return [k for k in known if k in asked]
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
@@ -240,9 +372,6 @@ def _make_op(comm, op_name, x):
             )
         return lambda: comm.all_gather(x)
     raise ValueError(f"unknown op {op_name!r}")
-
-
-CASE_TIMEOUT_S = 600
 
 
 def _collect(pool, rets):
@@ -425,56 +554,24 @@ def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Outco
                                                    worst_at=worst_at, atol=atol))
 
 
-@dataclass(frozen=True)
-class Report:
-    """A finished run: what every case did, and what that means for the run as a whole."""
+def check_selector() -> None:
+    """The selector's contract, before any case spends a GPU on it.
 
-    outcomes: Sequence[Outcome]
-
-    @property
-    def failures(self) -> List[Outcome]:
-        return [o for o in self.outcomes if not o.ok]
-
-    @property
-    def conclusion(self) -> Optional[str]:
-        """The run's ONE conclusion, or None if every case passed.
-
-        CONTROL FIRST and separately: the control backend is known-good, so it failing means the
-        HARNESS is unsound and every other line in the table is worthless -- a different message
-        from a backend bug.
-        """
-        bad = self.failures
-        if not bad:
-            return None
-        ctrl = [o for o in bad if o.case.backend == CONTROL]
-        if ctrl:
-            return (f"CONTROL FAILED: {CONTROL} is wrong or hung under this harness "
-                    f"({ctrl[0].case} -- {ctrl[0].message}). The harness is unsound; no other "
-                    f"verdict in the table can be trusted.")
-        hung = [o for o in bad if o.hung]
-        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
-        return (f"{lead}{len(bad)} of {len(self.outcomes)} case(s) failed (control passed, so "
-                f"these are real backend bugs): "
-                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
-
-    @property
-    def exit_code(self) -> int:
-        return 1 if self.conclusion else 0
-
-
-@dataclass(frozen=True)
-class Plan:
-    """WHAT to run and HOW: the cases, plus the parameters every case shares.
-
-    The output of `parse` and the input to `run`, so "did these flags produce the cases I meant" is
-    answerable without a GPU.
+    Two things no case can check: that an unknown name RAISES (cases only pass valid ones), and that
+    distinct names build distinct classes -- a copy-paste pointing two at one impl would silently
+    make two "different" arms the same measurement. `None` counts as unknown, and since
+    `make_communicator` reads AITER_COMMS_BACKEND for that case, it is checked against an EMPTY
+    environment.
     """
+    assert len(set(_BACKEND_CLASS.values())) == len(_BACKEND_CLASS), "two names, one impl"
+    with patch.dict(os.environ, {}, clear=True):
+        for bad in (None, "hpi", "Iris ", "", "nccl"):
+            try:
+                make_communicator(None, None, 0, backend=bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"backend {bad!r} was accepted; it must raise")
 
-    cases: Sequence[Case]
-    world: int
-    addr: str
-    port: int                       # RESOLVED by `parse`, so no case reaches for one later
-    list_only: bool
 
 
 def parse(argv: Optional[Sequence[str]] = None) -> Plan:
@@ -500,25 +597,6 @@ def parse(argv: Optional[Sequence[str]] = None) -> Plan:
         port=get_open_port() if args.port is None else args.port,
         list_only=args.list,
     )
-
-
-def check_selector() -> None:
-    """The selector's contract, before any case spends a GPU on it.
-
-    Two things no case can check: that an unknown name RAISES (cases only pass valid ones), and that
-    distinct names build distinct classes -- a copy-paste pointing two at one impl would silently
-    make two "different" arms the same measurement. `None` counts as unknown, and since
-    `make_communicator` reads AITER_COMMS_BACKEND for that case, it is checked against an EMPTY
-    environment.
-    """
-    assert len(set(_BACKEND_CLASS.values())) == len(_BACKEND_CLASS), "two names, one impl"
-    with patch.dict(os.environ, {}, clear=True):
-        for bad in (None, "hpi", "Iris ", "", "nccl"):
-            try:
-                make_communicator(None, None, 0, backend=bad)
-            except ValueError:
-                continue
-            raise AssertionError(f"backend {bad!r} was accepted; it must raise")
 
 
 def run(plan: Plan) -> Report:
@@ -564,84 +642,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     the work, so it is a helper inside `run` rather than a phase of its own.
     """
     return emit(run(parse(argv)))
-
-
-def _pick(raw: Optional[str], known: Sequence[str], what: str) -> List[str]:
-    """A comma-separated subset of `known`, in `known`'s order. Unknown names REFUSE rather than
-    silently narrowing the run to nothing."""
-    if not raw:
-        return list(known)
-    asked = [s.strip() for s in raw.split(",") if s.strip()]
-    unknown = [s for s in asked if s not in known]
-    if unknown:
-        raise SystemExit(f"unknown {what}(s) {unknown}; known: {list(known)}")
-    return [k for k in known if k in asked]
-
-
-l_dtype = ["fp16", "bf16"]
-l_shape = [(4, 8192), (128, 8192), (256, 8192)]
-
-parser = argparse.ArgumentParser(description="config input of test")
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="data type",
-)
-parser.add_argument(
-    "-s",
-    "--shape",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="shape. e.g. -s 128,8192",
-)
-parser.add_argument(
-    "--addr",
-    type=str,
-    default="127.0.0.1",
-    help="rendezvous address the ranks connect to (default: 127.0.0.1)",
-)
-parser.add_argument(
-    "--port",
-    type=int,
-    default=None,
-    help="rendezvous port. Omitted (the default) picks a FREE one per case, so two runs on a "
-         "shared box cannot collide. Pin it only to debug a specific rendezvous.",
-)
-parser.add_argument(
-    "-l",
-    "--list",
-    action="store_true",
-    help="print the matrix and exit, running nothing (what WILL run, before spending GPUs on it)",
-)
-parser.add_argument(
-    "-m",
-    "--mode",
-    type=str,
-    default=None,
-    help=f"comma-separated subset of {','.join(MODES)} (default: all)",
-)
-parser.add_argument(
-    "-w",
-    "--world",
-    type=int,
-    default=8,
-    help="ranks to run each case across (default: 8)",
-)
-parser.add_argument(
-    "-b",
-    "--backend",
-    type=str,
-    default=None,
-    help=f"comma-separated subset of {','.join(BACKENDS)} (default: all, in that order)",
-)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
