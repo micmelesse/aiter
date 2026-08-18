@@ -20,16 +20,12 @@ replay's output checked against its own reference. That is the mode that catches
 the dropped/stale all_gather race the identical-input loop misses.
 """
 
-import argparse
 import logging
-import os
-import shlex
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
 from multiprocessing import Pool, set_start_method
-from typing import List, Mapping, Sequence, Tuple
-from typing_extensions import Optional
+from typing import Tuple
 
 import pytest
 import torch
@@ -95,8 +91,9 @@ _BACKEND_CLASS = {
     "iris": IrisCommunicator,
 }
 
+# Control FIRST, because it is the outermost pytest parameter and therefore the first case to run:
+# if torch is red, nothing after it means anything.
 BACKENDS = tuple(_BACKEND_CLASS)
-CONTROL = BACKENDS[0]
 
 
 # ── THE DOMAIN: one type, one generator ──
@@ -119,8 +116,8 @@ CONTROL = BACKENDS[0]
 MODES = ("eager", "graph")
 
 
-l_dtype = ["fp16", "bf16"]
-l_shape = [(4, 8192), (128, 8192), (256, 8192)]
+DTYPES = ("fp16", "bf16")
+SHAPES = ((4, 8192), (128, 8192), (256, 8192))
 
 
 @dataclass(frozen=True)
@@ -152,185 +149,15 @@ class Measurement:
     atol: float
 
 
-@dataclass(frozen=True)
-class Outcome:
-    """What became of one case: it measured something, or it failed with an exception.
-
-    ONE optional-pair rather than `ok`/`hung`/`error` flags. Those could contradict each other
-    (`ok=True, hung=True` was representable and meaningless) and flattened the exception to a
-    string, losing the traceback. `hung` is not a field at all now -- it is
-    `isinstance(failure, mp.TimeoutError)`, which is where that fact actually lives.
-    """
-
-    case: Case
-    measured: Optional[Measurement] = None
-    failure: Optional[BaseException] = None
-
-    @property
-    def ok(self) -> bool:
-        return self.measured is not None and self.measured.within_tolerance
-
-    @property
-    def hung(self) -> bool:
-        return isinstance(self.failure, mp.TimeoutError)
-
-    @property
-    def label(self) -> str:
-        if self.hung:
-            return "HUNG"
-        if self.failure is not None:
-            return "ERROR"
-        return "OK" if self.ok else "FAIL"
-
-    @property
-    def message(self) -> str:
-        """What this case knows. A hung one has no diff, and `worst|diff|=0` would read as a pass."""
-        if self.hung:
-            return f"no answer in {CASE_TIMEOUT_S}s"
-        if self.failure is not None:
-            return f"{type(self.failure).__name__}: {self.failure}"
-        m = self.measured
-        assert m is not None            # no failure and no measurement is unrepresentable
-        at = f" @replay {m.worst_at}" if m.worst_at >= 0 else ""
-        return f"worst|diff|={m.worst_diff:.3g} atol={m.atol}{at}"
 
 
-@dataclass(frozen=True)
-class Plan:
-    """WHAT to run and HOW: the cases, plus the parameters every case shares.
-
-    The output of `parse` and the input to `run`, so "did these flags produce the cases I meant" is
-    answerable without a GPU.
-    """
-
-    cases: Sequence[Case]
-    world: int
-    addr: str
-    port: int                       # RESOLVED by `parse`, so no case reaches for one later
-    list_only: bool
 
 
-@dataclass(frozen=True)
-class Report:
-    """A finished run: what every case did, and what that means for the run as a whole."""
-
-    outcomes: Sequence[Outcome]
-
-    @property
-    def failures(self) -> List[Outcome]:
-        return [o for o in self.outcomes if not o.ok]
-
-    @property
-    def conclusion(self) -> Optional[str]:
-        """The run's ONE conclusion, or None if every case passed.
-
-        CONTROL FIRST and separately: the control backend is known-good, so it failing means the
-        HARNESS is unsound and every other line in the table is worthless -- a different message
-        from a backend bug.
-        """
-        bad = self.failures
-        if not bad:
-            return None
-        ctrl = [o for o in bad if o.case.backend == CONTROL]
-        if ctrl:
-            return (f"CONTROL FAILED: {CONTROL} is wrong or hung under this harness "
-                    f"({ctrl[0].case} -- {ctrl[0].message}). The harness is unsound; no other "
-                    f"verdict in the table can be trusted.")
-        hung = [o for o in bad if o.hung]
-        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
-        return (f"{lead}{len(bad)} of {len(self.outcomes)} case(s) failed (control passed, so "
-                f"these are real backend bugs): "
-                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
-
-    @property
-    def exit_code(self) -> int:
-        return 1 if self.conclusion else 0
-
-parser = argparse.ArgumentParser(description="config input of test")
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="data type",
-)
-parser.add_argument(
-    "-s",
-    "--shape",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="shape. e.g. -s 128,8192",
-)
-parser.add_argument(
-    "--addr",
-    type=str,
-    default="127.0.0.1",
-    help="rendezvous address the ranks connect to (default: 127.0.0.1)",
-)
-parser.add_argument(
-    "--port",
-    type=int,
-    default=None,
-    help="rendezvous port. Omitted (the default) picks a FREE one per case, so two runs on a "
-         "shared box cannot collide. Pin it only to debug a specific rendezvous.",
-)
-parser.add_argument(
-    "-l",
-    "--list",
-    action="store_true",
-    help="print the matrix and exit, running nothing (what WILL run, before spending GPUs on it)",
-)
-parser.add_argument(
-    "-m",
-    "--mode",
-    type=str,
-    default=None,
-    help=f"comma-separated subset of {','.join(MODES)} (default: all)",
-)
-parser.add_argument(
-    "-w",
-    "--world",
-    type=int,
-    default=8,
-    help="ranks to run each case across (default: 8)",
-)
-parser.add_argument(
-    "-b",
-    "--backend",
-    type=str,
-    default=None,
-    help=f"comma-separated subset of {','.join(BACKENDS)} (default: all, in that order)",
-)
 
 
-def cases(backends: Sequence[str], ops: Sequence[str], dts: Sequence["torch.dtype"],
-          shapes: Sequence[Tuple[int, ...]], modes: Sequence[str] = MODES) -> List[Case]:
-    """THE matrix, and the only place its order is decided.
-
-    BACKEND is outermost so the control runs first: torch is known-good, so if it fails the harness
-    is unsound and no later verdict means anything. MODE is innermost so everything about one
-    (backend, op, dtype, shape) is known before moving on -- with the modes split across two phases,
-    a hang in `varying` was reachable only after the whole identical-input matrix had passed.
-    """
-    return [Case(b, op, dt, sh, m)
-            for b in backends for op in ops for dt in dts for sh in shapes for m in modes]
 
 
-def _pick(raw: Optional[str], known: Sequence[str], what: str) -> List[str]:
-    """A comma-separated subset of `known`, in `known`'s order. Unknown names REFUSE rather than
-    silently narrowing the run to nothing."""
-    if not raw:
-        return list(known)
-    asked = [s.strip() for s in raw.split(",") if s.strip()]
-    unknown = [s for s in asked if s not in known]
-    if unknown:
-        raise SystemExit(f"unknown {what}(s) {unknown}; known: {list(known)}")
-    return [k for k in known if k in asked]
+
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
@@ -521,15 +348,11 @@ def run_rank(rank, world, pp, case, init_method):
     return verdict
 
 
-def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Outcome:
-    """Run ONE case across `world` ranks. THE boundary: the only place a case failure is caught.
+def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Measurement:
+    """Run ONE case across `world` ranks: spawn, collect under a timeout, take the worst rank's.
 
-    Spawn, collect under a timeout, take the worst rank's numbers.
-
-    It CATCHES rather than propagates because a per-case failure must not abandon the cases after
-    it: the summary is the deliverable, and one backend's bug must not hide another's. Everything
-    below raises normally; this is the one seam that turns an exception -- a timeout included -- into
-    a recorded outcome.
+    It RAISES: one case per test makes pytest the boundary that turns a failure -- a timeout
+    included -- into one red result rather than the end of the run.
     """
     # The rendezvous, and the ONLY channel for it. Deliberately not `MASTER_ADDR`/`MASTER_PORT`:
     # nothing in `aiter.dist` reads those, and torch consults them only for `init_method="env://"`.
@@ -540,150 +363,87 @@ def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Outco
         rets = [pool.apply_async(run_rank, args=(r, world, pp, case, init)) for r in range(world)]
         pool.close()
         per_rank = _collect(pool, rets)
-    except BaseException as exc:       # noqa: BLE001 -- a case failure is data, not a crash
-        return Outcome(case=case, failure=exc)
+    finally:
+        pool.terminate()               # frees the GPUs whether the case passed, failed or hung
 
     # EVERY rank's verdict, reduced to the worst. A collective's bug is often visible on only a
     # subset of ranks (a distance/topology effect), so one rank's view is a single data point --
     # the case passes only if every rank passed.
     ok = all(r[0] for r in per_rank)
     _, worst_diff, worst_at, atol = max(per_rank, key=lambda r: r[1])
-    return Outcome(case=case, measured=Measurement(within_tolerance=ok, worst_diff=worst_diff,
-                                                   worst_at=worst_at, atol=atol))
+    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_at=worst_at, atol=atol)
 
 
-def parse(argv: Optional[Sequence[str]] = None,
-          environ: Optional[Mapping[str, str]] = None) -> Plan:
-    """PARSE: argv in -> the Plan it names, out. Reads argv, the environment and the machine.
+@pytest.fixture(scope="session")
+def world() -> int:
+    """Every GPU on the box. A read of the machine, so it is a fixture rather than a constant."""
+    return torch.cuda.device_count()
 
-    `argv` None under pytest, where there is none -- the matrix then comes from `COMMS_ARGS`, the
-    same variable the workload declares, so the run is spelled ONE way whichever entry point starts
-    it. Both are read HERE and nowhere else.
 
-    It resolves the rendezvous port here rather than per case: finding a free one is a read of the
-    machine, and every such read belongs in this phase. One port serves the run because the cases
-    are sequential, each tearing its process group down before the next starts.
+@pytest.fixture
+def rendezvous() -> Tuple[str, int]:
+    """A FRESH port per case: the cases are sequential and each tears its group down, but two runs
+    on a shared box must not collide."""
+    return "127.0.0.1", get_open_port()
 
-    It touches nothing under test -- no communicator is built here.
+
+@pytest.mark.parametrize("world_size", (2, 4, 8))
+def test_admission_matches_the_baseline(world_size: int) -> None:
+    """Every backend admits exactly what `CustomAllreduce` does, which is the path they replace.
+
+    THE precondition for the matrix below meaning anything: if an arm takes a tensor the baseline
+    declines, the arms route different work and the numbers compare routing, not kernels.
+
+    Needs no GPU -- both predicates read only tensor metadata plus a few attributes -- so it holds
+    even where the matrix cannot run. fp32 is excluded and expected to diverge: `hip_comms.cu` has
+    fp16 and bf16 instantiations only, so closing that needs a kernel, not a predicate.
     """
-    env = os.environ if environ is None else environ
-    if argv is None:
-        argv = shlex.split(env.get("COMMS_ARGS", ""))
-    args = parser.parse_args(argv)
-    return Plan(
-        cases=cases(
-            _pick(args.backend, BACKENDS, "backend"), OPS,
-            [dtypes.d_dtypes[args.dtype]] if args.dtype
-            else [dtypes.d_dtypes[k] for k in l_dtype],
-            [args.shape] if args.shape else list(l_shape),
-            _pick(args.mode, MODES, "mode"),
-        ),
-        world=args.world,
-        addr=args.addr,
-        port=get_open_port() if args.port is None else args.port,
-        list_only=args.list,
-    )
-
-
-def admission_divergences(world: int) -> List[str]:
-    """Where our backends admit a different set than `CustomAllreduce`, which they replace.
-
-    THE precondition for the run meaning anything: if an arm takes a tensor the baseline declines,
-    the arms route different work and the numbers compare routing rather than kernels. Both
-    predicates read only tensor metadata plus a few attributes, so no GPU and no process group --
-    `object.__new__` is enough, and CPU tensors are enough.
-
-    fp32 is expected to diverge and is not reported: `hip_comms.cu` has fp16 and bf16 instantiations
-    only, so closing that needs a kernel, not a predicate.
-    """
-    def _attrs(obj, **kw):
+    def _as(cls, **kw):
+        obj = object.__new__(cls)
         for k, v in kw.items():
             setattr(obj, k, v)
         return obj
 
-    base = _attrs(object.__new__(CustomAllreduce), disabled=False, world_size=world,
-                  fully_connected=True, max_size=_DEFAULT_MAX_SIZE)
-    ours = _attrs(object.__new__(TorchCommunicator), disabled=False, world_size=world,
-                  max_size=_DEFAULT_MAX_SIZE)
-    # Every power of two across the range PLUS the current boundaries and one element either side.
-    # Boundaries alone are not enough: they are the edges of the rules as they are now, so a wrong
-    # rule that diverges in the band BETWEEN two of them shows up on neither.
+    base = _as(CustomAllreduce, disabled=False, world_size=world_size, fully_connected=True,
+               max_size=_DEFAULT_MAX_SIZE)
+    ours = _as(TorchCommunicator, disabled=False, world_size=world_size, max_size=_DEFAULT_MAX_SIZE)
+    # Every power of two across the range PLUS the current bounds and one element either side.
+    # Bounds alone are the edges of the rules AS THEY ARE, so a wrong rule that diverges in the band
+    # between two of them shows up on neither -- measured: the bound we shipped went unseen at
+    # world 2 and 4 under a bounds-only grid.
     edges = tuple(1 << k for k in range(4, 28)) + (
-        _DEFAULT_MAX_SIZE // (world * 2), _DEFAULT_MAX_SIZE, 8192 * 8192)
-    out: List[str] = []
+        _DEFAULT_MAX_SIZE // (world_size * 2), _DEFAULT_MAX_SIZE, 8192 * 8192)
     for dtype in (torch.float16, torch.bfloat16):
         es = torch.empty(0, dtype=dtype).element_size()
         for nbytes in sorted({e + d for e in edges for d in (-es, 0, es) if e + d > 0}):
             if nbytes % es:
                 continue
             t = torch.empty(nbytes // es, dtype=dtype)
-            for op, want, got in (
-                ("all_reduce", base.should_custom_ar(t), ours.should_allreduce(t)),
-                ("all_gather", base.should_custom_ag(t), ours.should_allgather(t)),
-            ):
-                if want != got:
-                    out.append(f"{op} {dtype} {nbytes}B: baseline={want} ours={got}")
-    return out
+            assert base.should_custom_ar(t) == ours.should_allreduce(t), (
+                f"all_reduce admission diverged: {dtype} {nbytes}B world={world_size}")
+            assert base.should_custom_ag(t) == ours.should_allgather(t), (
+                f"all_gather admission diverged: {dtype} {nbytes}B world={world_size}")
 
 
-def run(plan: Plan) -> Report:
-    """RUN: a Plan in -> a Report out. Everything that touches the code under test lives here.
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "x".join(map(str, s)))
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("op", OPS)
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_collective_matches_the_reference(backend: str, op: str, dtype: str,
+                                          shape: Tuple[int, ...], mode: str,
+                                          world: int, rendezvous: Tuple[str, int]) -> None:
+    """ONE case: one backend's one collective, at one dtype and shape, in one mode.
 
-    It prints as it goes, which is emission inside the doing phase and deliberate: a case that
-    hangs must have named itself BEFORE it hung, or the log cannot say which one did.
+    A test PER CASE, so a hang or a fault is one red result rather than the end of the run, and
+    `-k` selects instead of a flag. BACKEND is the outermost parameter, so the control runs first:
+    if torch is red, nothing after it means anything.
     """
-    print(f"world={plan.world}  rendezvous={plan.addr}:{plan.port}  "
-          f"{len(plan.cases)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
-    for i, case in enumerate(plan.cases, 1):
-        print(f"  {i:3}  {case}")
-    if plan.list_only:
-        return Report(())
-
-    outcomes: List[Outcome] = []
-    for i, case in enumerate(plan.cases, 1):
-        print(f"[{i}/{len(plan.cases)}] {case}", flush=True)
-        o = run_case(case, world=plan.world, addr=plan.addr, port=plan.port)
-        print(f"      -> {o.label:5}  {o.message}", flush=True)
-        outcomes.append(o)
-    return Report(outcomes)
-
-
-def emit(report: Report) -> int:
-    """EMIT: a Report in -> the summary printed and an exit code out. The only writer."""
-    if report.outcomes:
-        print("\n==== correctness summary ====")
-        for o in report.outcomes:
-            print(f"  [{o.label:5}] {o.case}  {o.message}")
-    if report.conclusion:
-        print(f"\n{report.conclusion}", flush=True)
-    elif report.outcomes:
-        print(f"\nall {len(report.outcomes)} case(s) within tolerance", flush=True)
-    return report.exit_code
-
-
-@pytest.mark.parametrize("world", (2, 4, 8))
-def test_admission_matches_the_baseline(world: int) -> None:
-    """Every backend admits exactly what `CustomAllreduce` does -- see `admission_divergences`.
-
-    Needs no GPU, so it holds the property the matrix below depends on even where the matrix cannot
-    run."""
-    assert admission_divergences(world) == []
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="the matrix is a multi-rank collective; it needs the GPUs")
-def test_the_correctness_matrix() -> None:
-    """THE run: every backend x op x dtype x shape x mode, from `COMMS_ARGS`."""
-    assert main() == 0
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """PARSE, RUN, EMIT -- and nothing else, so the whole program is one line.
-
-    Read the command line, do the work, say what happened. Drawing the conclusion is part of doing
-    the work, so it is a helper inside `run` rather than a phase of its own.
-    """
-    return emit(run(parse(argv)))
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    addr, port = rendezvous
+    case = Case(backend=backend, op=op, dtype=dtypes.d_dtypes[dtype], shape=shape, mode=mode)
+    got = run_case(case, world=world, addr=addr, port=port)
+    assert got.within_tolerance, (
+        f"{case}: worst|diff|={got.worst_diff:g} atol={got.atol:g}"
+        + (f" @replay {got.worst_at}" if got.worst_at is not None else ""))
