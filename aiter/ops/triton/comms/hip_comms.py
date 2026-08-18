@@ -203,8 +203,13 @@ class HipComms:
         the graph's life -- the replayed kernel reads a peer-pointer set populated after
         the capture that recorded its launch.
         """
-        yield
-        self.flush_pending()
+        try:
+            yield
+        finally:
+            # FINALLY, so a capture that raises still registers what it recorded. Without it the
+            # slots stay null and the next launch faults on a null peer pointer -- the original
+            # error is then buried under a GPU memory fault that names nothing.
+            self.flush_pending()
 
     def flush_pending(self) -> None:
         """Register whatever the capture deferred. A no-op when nothing is pending."""
