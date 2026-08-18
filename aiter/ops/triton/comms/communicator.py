@@ -15,8 +15,12 @@ from . import hip_comms
 
 logger = logging.getLogger(__name__)
 
-# Match CustomAllreduce default (8 MB).
+# Both taken from `CustomAllreduce`, because these backends replace it and an envelope that differs
+# changes which tensors take the fast path. `max_size` is the declared message budget (it drives the
+# all_gather bound); `_AR_MAX_BYTES` is the decode all-reduce ceiling, which baseline hardcodes
+# independently of its own max_size -- conflating the two is what made ours 8x too tight there.
 _DEFAULT_MAX_SIZE = 8 * 1024 * 1024
+_AR_MAX_BYTES = 8192 * 8192
 
 
 def _iris_available() -> bool:
@@ -84,15 +88,12 @@ class Communicator(ABC):
         return (
             not self.disabled
             and self._shaped_for_a_kernel(inp)
-            and inp.numel() * inp.element_size() < self.max_size
+            and inp.numel() * inp.element_size() <= _AR_MAX_BYTES
         )
 
     def should_allgather(self, inp: torch.Tensor) -> bool:
-        """Tighter than all_reduce, and deliberately the same formula `CustomAllreduce.should_custom_ag`
-        uses: the output is world_size x the input, so the per-rank input has to fit a fraction of the
-        buffer. Ours was bounded by `max_size` like all_reduce, which at TP=8 admitted 16x what the
-        path we replace does -- so a gather it hands to NCCL we would have taken, and the difference
-        would have read as a kernel result."""
+        """`CustomAllreduce.should_custom_ag`'s bound: the output is world_size x the input, so the
+        per-rank input has to fit a fraction of the budget."""
         return (
             not self.disabled
             and self._shaped_for_a_kernel(inp)
@@ -103,11 +104,10 @@ class Communicator(ABC):
         """What both ops need, for every backend: a contiguous, 16-byte-aligned run of bytes in a
         dtype the kernels are instantiated for.
 
-        Same rules as `CustomAllreduce.should_custom_ar`, which is the path these backends replace --
-        admitting a different set would change which tensors take the fast path and make the arms
-        incomparable with the baseline. The one deliberate difference is DTYPE: the baseline does not
-        check it, our kernels exist only for fp16 and bf16, so an fp32 all-reduce falls back for us and
-        does not for it."""
+        Same rules as `CustomAllreduce.should_custom_ar`, the path these backends replace: a different
+        envelope changes which tensors take the fast path and makes the arms incomparable. DTYPE is the
+        one divergence left -- baseline does not check it, our kernels exist only for fp16 and bf16 --
+        and `test_admission_matches_baseline.py` is what holds the rest identical."""
         nbytes = inp.numel() * inp.element_size()
         return (
             _is_weak_contiguous(inp)
@@ -242,10 +242,10 @@ class IrisCommunicator(Communicator):
 
         # The heap and the slab are limits on the CONFIGURATION, not on a tensor: if `max_size` fits
         # inside both, no admitted input can exceed either, so nothing needs re-checking per call.
-        if max_size * 2 > self._HEAP_SIZE or max_size > self._AG_SLAB_SIZE:
+        if _AR_MAX_BYTES * 2 > self._HEAP_SIZE or max_size / (world_size * 2) > self._AG_SLAB_SIZE:
             logger.warning(
-                "IrisCommunicator disabled: max_size=%dMB does not fit heap=%dGB / slab=%dMB",
-                max_size >> 20, self._HEAP_SIZE >> 30, self._AG_SLAB_SIZE >> 20,
+                "IrisCommunicator disabled: heap=%dGB / slab=%dMB cannot back the admitted bounds",
+                self._HEAP_SIZE >> 30, self._AG_SLAB_SIZE >> 20,
             )
             return
         self.disabled = False
@@ -464,7 +464,10 @@ class HipCommunicator(Communicator):
         # same arch, same world size -- but if they ever were not, the ranks that got here
         # would HANG waiting for the ones that returned, rather than failing. Worth
         # knowing because a deadlock is far worse than an error.
-        self._comms = hip_comms.HipComms(cpu_group, self.device)
+        # The staging buffer backs the EAGER path, so it has to hold the largest input we admit --
+        # the ceiling, not the message budget. They were the same number, which is what capped
+        # all_reduce at 8 MiB.
+        self._comms = hip_comms.HipComms(cpu_group, self.device, max_size=_AR_MAX_BYTES)
         self.disabled = False
         logger.info(
             "HipCommunicator ready: world_size=%d max_size=%dMB",
