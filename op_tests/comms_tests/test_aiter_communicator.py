@@ -77,10 +77,6 @@ OPS = ["all_reduce", "all_gather"]
 # _build_communicator checks `.disabled` here.
 
 
-# What each backend name MUST construct. Stated here independently of the factory's
-# if-chain on purpose: if the two ever disagree, one of them is wrong and this is what
-# says so. A factory branch wired to the wrong class is silent -- you ask for iris, get
-# something else, and the run produces a plausible number for the wrong thing.
 # What each backend name MUST construct. Stated independently of the factory's if-chain on purpose:
 # if the two ever disagree, one of them is wrong and this is what says so. A factory branch wired to
 # the wrong class is silent -- you ask for iris, get something else, and the run produces a
