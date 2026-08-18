@@ -215,6 +215,16 @@ def run_comm(
 
     result = out.clone()
 
+    # FREE THE GRAPH BEFORE TEARING DOWN THE PROCESS GROUP. A captured graph holds references to
+    # the NCCL communicator's work and buffers, and `destroy_process_group` blocks draining work a
+    # live graph still owns -- every rank then waits inside it forever. Seen 2026-08-18: all 8 ranks
+    # stuck in `destroy_process_group` on the `all_gather` capture case, GPUs at 0%, for 8 minutes
+    # until it was killed. `out` goes too: it is a graph-pool tensor, so it keeps the pool alive.
+    if capture:
+        del graph
+    del out
+    torch.cuda.synchronize()
+
     if dist.is_initialized():
         destroy_model_parallel()
         destroy_distributed_environment()
@@ -402,6 +412,11 @@ def run_comm_vary(
             worst_diff, worst_k = d, k
         if not torch.allclose(got, ref_k, atol=atol, rtol=rtol):
             ok = False
+
+    # Same teardown deadlock as `run_comm`: free the graph (and its pool tensors) before the
+    # process group, or every rank hangs in `destroy_process_group` draining work the graph owns.
+    del graph, out, out_buf
+    torch.cuda.synchronize()
 
     if dist.is_initialized():
         destroy_model_parallel()
