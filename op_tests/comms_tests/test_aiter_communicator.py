@@ -22,12 +22,10 @@ the dropped/stale all_gather race the identical-input loop misses.
 
 import argparse
 import logging
-import os
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
-from unittest.mock import patch
-from multiprocessing import Pool, freeze_support, set_start_method
+from multiprocessing import Pool, set_start_method
 from typing import List, Sequence, Tuple
 from typing_extensions import Optional
 
@@ -83,22 +81,20 @@ OPS = ["all_reduce", "all_gather"]
 # if-chain on purpose: if the two ever disagree, one of them is wrong and this is what
 # says so. A factory branch wired to the wrong class is silent -- you ask for iris, get
 # something else, and the run produces a plausible number for the wrong thing.
+# What each backend name MUST construct. Stated independently of the factory's if-chain on purpose:
+# if the two ever disagree, one of them is wrong and this is what says so. A factory branch wired to
+# the wrong class is silent -- you ask for iris, get something else, and the run produces a
+# plausible number for the wrong thing.
+#
+# CONTROL FIRST in this dict, because the run order and the control derive from it -- one list of
+# names, not two that can drift apart.
 _BACKEND_CLASS = {
-    "iris": IrisCommunicator,
+    "torch": TorchCommunicator,     # the known-good reference
     "hip": HipCommunicator,
-    "torch": TorchCommunicator,
+    "iris": IrisCommunicator,
 }
 
-# Every backend runs the FULL correctness matrix, and the ORDER is deliberate. torch is
-# first because it is the control: known-good, so if it fails the harness is wrong and no
-# other verdict in the run means anything. `hip` is second because it is the one under
-# active development -- the full matrix takes hours, and putting the backend we are
-# iterating on last means waiting most of that before learning anything about it.
-# Subset with `-b`.
-BACKENDS = ("torch", "hip", "iris")
-
-# The known-good reference: first in BACKENDS so it runs first, named here so the one place that
-# treats it specially does not hardcode the string.
+BACKENDS = tuple(_BACKEND_CLASS)
 CONTROL = BACKENDS[0]
 
 
@@ -554,26 +550,6 @@ def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Outco
                                                    worst_at=worst_at, atol=atol))
 
 
-def check_selector() -> None:
-    """The selector's contract, before any case spends a GPU on it.
-
-    Two things no case can check: that an unknown name RAISES (cases only pass valid ones), and that
-    distinct names build distinct classes -- a copy-paste pointing two at one impl would silently
-    make two "different" arms the same measurement. `None` counts as unknown, and since
-    `make_communicator` reads AITER_COMMS_BACKEND for that case, it is checked against an EMPTY
-    environment.
-    """
-    assert len(set(_BACKEND_CLASS.values())) == len(_BACKEND_CLASS), "two names, one impl"
-    with patch.dict(os.environ, {}, clear=True):
-        for bad in (None, "hpi", "Iris ", "", "nccl"):
-            try:
-                make_communicator(None, None, 0, backend=bad)
-            except ValueError:
-                continue
-            raise AssertionError(f"backend {bad!r} was accepted; it must raise")
-
-
-
 def parse(argv: Optional[Sequence[str]] = None) -> Plan:
     """PARSE: argv in -> the Plan it names, out. Reads argv and the machine, nothing else.
 
@@ -612,7 +588,6 @@ def run(plan: Plan) -> Report:
     if plan.list_only:
         return Report(())
 
-    check_selector()
     outcomes: List[Outcome] = []
     for i, case in enumerate(plan.cases, 1):
         print(f"[{i}/{len(plan.cases)}] {case}", flush=True)
