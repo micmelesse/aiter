@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 """Correctness of EVERY communicator backend's collective ops (all_reduce and
-all_gather) in eager mode, under cudagraph capture + replay, AND under capture +
-replay with the input changing every replay.
+all_gather) in two modes: `eager` (one call) and `graph` (captured once, then replayed with a
+FRESH input every replay).
 
 One question per backend: does it produce correct results? Eager
 alone is not enough — the gluon kernels elide barriers under graph capture, and a
@@ -53,14 +53,14 @@ logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
-# Replays for the cudagraph case. Back-to-back with no inter-replay sync is what stresses an
+# Replays for the `graph` case. Back-to-back with no inter-replay sync is what stresses an
 # elided end barrier (replay N+1 must not start before replay N's writes land); a per-replay sync
 # would hide the race. 200 rather than more because each replay also keeps a snapshot output buffer
 # (N x out-shape) and a stale read shows within the first few differing replays anyway.
-NUM_VARY_REPLAYS = 200
+GRAPH_REPLAYS = 200
 
 # Deterministic per-(rank, replay) seed base for the varying-input check.
-_VARY_SEED = 20260615
+_INPUT_SEED = 20260615
 
 OPS = ["all_reduce", "all_gather"]
 
@@ -104,7 +104,7 @@ BACKENDS = ("torch", "hip", "iris")
 # shrink step would be a full 8-process run, so the sweep is hand-coded (CONTRIBUTING *Shrink and
 # bisect the input axis*). The domain is small and enumerated on purpose.
 
-# TWO modes, not three. `cudagraph` ALWAYS varies the input across replays, because the
+# TWO modes, not three. `graph` ALWAYS varies the input across replays, because the
 # identical-input variant could not catch the bug this suite exists for: if replay k+1 reads k's
 # buffer before k's writes land, it gets k's data -- which EQUALS the correct answer when every
 # input is identical, so the test passes while the race is live. vLLM copies a fresh activation in
@@ -113,14 +113,14 @@ BACKENDS = ("torch", "hip", "iris")
 # Keeping identical-input as a third mode bought exactly one thing -- telling "capture itself is
 # broken" apart from "staleness between replays" -- and `Measurement.worst_at` already gives that:
 # diverging at replay 0 is capture, at replay 1+ is staleness. Same answer, half the matrix.
-MODES = ("eager", "cudagraph")
+MODES = ("eager", "graph")
 
 
 @dataclass(frozen=True)
 class Case:
     """ONE unit of work: which backend, which collective, at what dtype and shape, replayed how.
 
-    `mode` is the axis that used to be duplicated code -- `eager`/`cudagraph` went through one
+    `mode` is the axis that used to be duplicated code -- `eager`/`graph` went through one
     driver and `varying` through a near-identical second one.
     """
 
@@ -138,13 +138,13 @@ class Case:
 class Measurement:
     """What a case that RAN produced. Pure numbers; no error channel."""
 
+    # The ranks' own allclose verdict, STORED rather than re-derived. Deriving it as
+    # `worst_diff <= atol` would be absolute-only, and a correct large-magnitude fp16 reduce exceeds
+    # a fixed atol through rounding alone -- so the derived form would fail cases the ranks passed.
+    within_tolerance: bool
     worst_diff: float
     worst_at: int               # replay index of the worst divergence; -1 for eager
     atol: float
-
-    @property
-    def within_tolerance(self) -> bool:
-        return self.worst_diff <= self.atol
 
 
 @dataclass(frozen=True)
@@ -264,60 +264,74 @@ def _make_op(comm, op_name, x):
     raise ValueError(f"unknown op {op_name!r}")
 
 
-def run_comm(
-    tp_size,
-    pp_size,
-    rankID,
-    x,
-    op_name,
-    backend,
-    distributed_init_method: Optional[str] = None,
-):
-    """One rank of an EAGER case: init distributed, build the `backend` communicator, call
-    `op_name` once, and return the result for the driver to check against the reference.
+CASE_TIMEOUT_S = 600
 
-    Eager only. Capture lives in `run_comm_vary`, because a captured graph is only worth replaying
-    against a CHANGING input -- replaying an identical one cannot catch a stale read (see MODES)."""
-    device = torch.device(f"cuda:{rankID}")
-    torch.cuda.set_device(device)
 
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, pp_size)
-    x = x.to(device)
+def _collect(pool, rets):
+    """Every rank's result, or raise `mp.TimeoutError` once `CASE_TIMEOUT_S` is up.
 
-    cpu_group = get_tp_group().cpu_group
-    group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
+    THE reason this exists rather than `pool.join()`: join waits forever. On 2026-08-18 all eight
+    ranks deadlocked inside `destroy_process_group` and the driver sat in join with nothing printed
+    for eight minutes. `AsyncResult.get(timeout=...)` is what makes a hang a reportable outcome, and
+    `terminate()` is what stops the ranks so the next case can have the GPUs.
+    """
+    deadline = time.monotonic() + CASE_TIMEOUT_S
+    out = []
+    try:
+        for r in rets:
+            out.append(r.get(timeout=max(1.0, deadline - time.monotonic())))
+    except mp.TimeoutError:
+        pool.terminate()
+        pool.join()
+        raise
+    pool.join()
+    return out
 
-    comm = _build_communicator(backend, cpu_group, group, device)
-    op = _make_op(comm, op_name, x)
 
-    # Warm up eagerly so first-call allocations (workspace, symmetric buffers)
-    # happen before capture — graph capture can't perform them cleanly.
-    for _ in range(3):
+def _replay_input(rank, k, shape, dtype):
+    """Deterministic input for (rank, replay k), generated on CPU.
+
+    CPU generation is bit-identical in every rank's process regardless of device (no reliance on
+    cross-GPU randn determinism), which is what lets each rank rebuild the FULL per-replay reference
+    locally -- including the other ranks' inputs -- without shipping tensors across the process
+    boundary. Deterministic rather than random on purpose: a failure has to be re-runnable, and an
+    exact reference makes any delta a real bug rather than fp noise.
+    """
+    g = torch.Generator().manual_seed(_INPUT_SEED + rank * 1_000_003 + k)
+    return torch.randn(shape, generator=g).to(dtype)
+
+
+def _run_eager(op, inputs, static_in):
+    """Call the collective once. Returns one output per input, so eager is the 1-replay case."""
+    static_in.copy_(inputs[0])
+    return [op().clone()]
+
+
+def _run_graph(op, inputs, static_in):
+    """Capture once, then replay with a FRESH input each time. One output per replay.
+
+    The graph is a LOCAL of this function, so it is freed when this returns -- which is what makes
+    the teardown deadlock structurally impossible rather than fixed by a remembered `del`. A live
+    captured graph holds the NCCL communicator's work, and `destroy_process_group` then blocks
+    draining work the graph still owns: on 2026-08-18 all eight ranks sat in it for eight minutes.
+
+    Only a cheap snapshot copy sits between replays so they stay back-to-back; an elided end barrier
+    needs that to race. All checking happens after a single sync.
+    """
+    for _ in range(3):          # warm up so first-call allocations happen before capture
         out = op()
     torch.cuda.synchronize()
 
-    result = out.clone()
-
-    # FREE THE GRAPH BEFORE TEARING DOWN THE PROCESS GROUP. A captured graph holds references to
-    # the NCCL communicator's work and buffers, and `destroy_process_group` blocks draining work a
-    # live graph still owns -- every rank then waits inside it forever. Seen 2026-08-18: all 8 ranks
-    # stuck in `destroy_process_group` on the `all_gather` capture case, GPUs at 0%, for 8 minutes
-    # until it was killed. `out` goes too: it is a graph-pool tensor, so it keeps the pool alive.
-    del out
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op()
+    snaps = torch.empty((len(inputs), *out.shape), dtype=out.dtype, device=out.device)
+    for k, x in enumerate(inputs):
+        static_in.copy_(x)
+        graph.replay()
+        snaps[k].copy_(out)     # snapshot before the next replay overwrites `out`
     torch.cuda.synchronize()
-
-    if dist.is_initialized():
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        torch.cuda.empty_cache()
-    return result
+    return [snaps[k] for k in range(len(inputs))]
 
 
 def reference(op_name, inputs, dim=-1):
@@ -370,244 +384,97 @@ def _collect(pool, rets):
     return out
 
 
-def test_communicator(
-    tp_size,
-    pp_size,
-    shape,
-    dtype,
-    op_name,
-    backend,
-    distributed_init_method: Optional[str] = None,
-):
-    """Driver for one EAGER case.
-    Returns (ok, worst_diff, atol)."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49373"
-    inputs = [torch.randn(shape, dtype=dtype) for _ in range(tp_size)]
-    ref = reference(op_name, inputs)
-    pool = Pool(processes=tp_size)
-    rets = [
-        pool.apply_async(
-            run_comm,
-            args=(
-                tp_size,
-                pp_size,
-                i,
-                inputs[i],
-                op_name,
-                backend,
-                distributed_init_method,
-            ),
-        )
-        for i in range(tp_size)
-    ]
-    pool.close()
-    rets = _collect(pool, rets)
-    # Return a verdict rather than raising, for the same reason the varying-input
-    # driver does: the caller runs EVERY backend before deciding, so one backend's
-    # failure must not abort the others. Same allclose semantics as that path.
-    atol = tolerance(op_name, dtype)
-    rtol = 0.01
-    ref32 = ref.to(torch.float32)
-    ok = True
-    worst_diff = 0.0
-    for out in rets:
-        got = out.to(ref).to(torch.float32)
-        worst_diff = max(worst_diff, (got - ref32).abs().max().item())
-        if not torch.allclose(got, ref32, atol=atol, rtol=rtol):
+def _judge(op_name, dtype, all_inputs, got):
+    """Every replay against its OWN reference. Pure. Returns (ok, worst_diff, worst_at, atol).
+
+    allclose semantics (atol + rtol*|ref|), not absolute-only: a correct large-magnitude reduce in
+    fp16 exceeds a fixed 0.01 through rounding alone, and the torch control caught exactly that.
+    `worst_at` is the diagnostic that let the identical-input mode be deleted -- diverging at replay
+    0 means capture is wrong, at replay 1+ means a stale read between replays.
+    """
+    atol, rtol = tolerance(op_name, dtype), 0.01
+    ok, worst_diff, worst_at = True, 0.0, -1
+    for k, mine in enumerate(got):
+        ref = reference(op_name, [all_inputs[r][k] for r in range(len(all_inputs))]).to(torch.float32)
+        cur = mine.to(torch.float32)
+        d = (cur - ref).abs().max().item()
+        if d > worst_diff:
+            worst_diff, worst_at = d, k
+        if not torch.allclose(cur, ref, atol=atol, rtol=rtol):
             ok = False
-    return ok, worst_diff, atol
+    return ok, worst_diff, worst_at, atol
 
 
-def _vary_input(rank, k, shape, dtype):
-    """Deterministic input for (rank, replay k), generated on CPU.
+def run_rank(rank, world, pp, case, init_method):
+    """ONE per-rank worker for EVERY case. Bring up, run the mode, judge, tear down.
 
-    CPU generation is bit-identical across every rank's process regardless of
-    device (no reliance on cross-GPU randn determinism), which is what lets each
-    rank rebuild the full per-replay reference locally — including the OTHER
-    ranks' inputs — without shipping data around. The caller moves it to the
-    device. A wrong reference would mean false failures, so this is generated the
-    bulletproof way even though it costs some CPU."""
-    g = torch.Generator().manual_seed(_VARY_SEED + rank * 1_000_003 + k)
-    return torch.randn(shape, generator=g).to(dtype)
-
-
-def run_comm_vary(
-    tp_size,
-    pp_size,
-    rankID,
-    shape,
-    dtype,
-    op_name,
-    backend,
-    distributed_init_method: Optional[str] = None,
-):
-    """One rank of the varying-input cudagraph check, for `backend` (any of BACKENDS;
-    'torch' is the known-good control).
-
-    Captures the op once, then replays NUM_VARY_REPLAYS times, copying a DIFFERENT
-    input into the static capture buffer before each replay — exactly how vLLM
-    drives a captured decode step (new activations written into the static input
-    every token). Only a cheap snapshot copy sits between replays so they stay
-    back-to-back (an elided end barrier needs that to race); all checking happens
-    after a single sync. Each replay's output is compared to its own reference;
-    returns (worst_abs_diff, worst_replay_index) for the driver."""
-    device = torch.device(f"cuda:{rankID}")
+    Was two near-identical functions (63L and 100L, 65% the same lines) split by whether the input
+    varied -- which is why the teardown bug existed in both copies and had to be fixed twice. The
+    only difference was WHERE the comparison happened, and that is gone: every rank rebuilds every
+    rank's input from a seed, so every rank judges its own replays and returns a verdict. Nothing
+    but scalars crosses the process boundary now.
+    """
+    device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, pp_size)
-
+    init_distributed_environment(world_size=world, rank=rank,
+                                 distributed_init_method=init_method)
+    ensure_model_parallel_initialized(world, pp)
     cpu_group = get_tp_group().cpu_group
     group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)     # force comm init before we measure
     torch.cuda.synchronize()
+    comm = _build_communicator(case.backend, cpu_group, group, device)
 
-    comm = _build_communicator(backend, cpu_group, group, device)
+    replays = GRAPH_REPLAYS if case.mode == "graph" else 1
+    all_inputs = [[_replay_input(r, k, case.shape, case.dtype).to(device)
+                   for k in range(replays)] for r in range(world)]
+    mine = all_inputs[rank]
+    static_in = mine[0].clone()
+    op = _make_op(comm, case.op, static_in)
 
-    # Full deterministic input matrix on this device: every rank's input for
-    # every replay. We need all ranks' inputs (not just ours) to build the
-    # per-replay reference after the run.
-    all_inputs = [
-        [_vary_input(r, k, shape, dtype).to(device) for k in range(NUM_VARY_REPLAYS)]
-        for r in range(tp_size)
-    ]
-    my_inputs = all_inputs[rankID]
+    runner = _run_graph if case.mode == "graph" else _run_eager
+    verdict = _judge(case.op, case.dtype, all_inputs, runner(op, mine, static_in))
 
-    static_in = my_inputs[0].clone()
-    op = _make_op(comm, op_name, static_in)
-
-    # Warm up eagerly so first-call allocations happen before capture.
-    for _ in range(3):
-        out = op()
+    # The ONE teardown in the file. Anything holding graph-pool memory goes first; the graph itself
+    # is already freed by `_run_graph` having returned.
+    del all_inputs, mine, static_in, op, comm
     torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = op()
-
-    # Back-to-back replays: fresh input in, snapshot out, no inter-replay sync.
-    out_buf = torch.empty(
-        (NUM_VARY_REPLAYS, *out.shape), dtype=out.dtype, device=device
-    )
-    for k in range(NUM_VARY_REPLAYS):
-        static_in.copy_(my_inputs[k])
-        graph.replay()
-        out_buf[k].copy_(out)  # snapshot before the next replay overwrites `out`
-    torch.cuda.synchronize()
-
-    # Check each replay against its own reference (post-sync; host side is fine).
-    # allclose semantics (atol + rtol*|ref|), SAME as the eager/identical path —
-    # absolute-only would flag a correct large-magnitude reduce (fp16 rounding of
-    # a sum of 8 values exceeds a fixed 0.01 even though the relative error is
-    # tiny; the torch control caught exactly that). worst_diff is reported for
-    # context; `ok` is the allclose verdict.
-    atol = tolerance(op_name, dtype)
-    rtol = 0.01
-    ok = True
-    worst_diff = 0.0
-    worst_k = -1
-    for k in range(NUM_VARY_REPLAYS):
-        ref_k = reference(op_name, [all_inputs[r][k] for r in range(tp_size)]).to(
-            torch.float32
-        )
-        got = out_buf[k].to(torch.float32)
-        d = (got - ref_k).abs().max().item()
-        if d > worst_diff:
-            worst_diff, worst_k = d, k
-        if not torch.allclose(got, ref_k, atol=atol, rtol=rtol):
-            ok = False
-
-    # Same teardown deadlock as `run_comm`: free the graph (and its pool tensors) before the
-    # process group, or every rank hangs in `destroy_process_group` draining work the graph owns.
-    del graph, out, out_buf
-    torch.cuda.synchronize()
-
     if dist.is_initialized():
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
-    return ok, worst_diff, worst_k
+    return verdict
 
 
-def test_communicator_vary(
-    tp_size,
-    pp_size,
-    shape,
-    dtype,
-    op_name,
-    backend,
-    distributed_init_method: Optional[str] = None,
-):
-    """Driver for one varying-input cudagraph case. Each rank self-checks every
-    replay against the per-replay reference; we take the worst over ranks and
-    return a verdict (the caller aggregates and decides pass/fail, so the control
-    and iris arms both run before any assertion). A dropped/stale symmetric-heap
-    read surfaces here as an O(1) diff — the failure mode the identical-input
-    replay loop cannot see. Returns (ok, worst_diff, worst_k, atol)."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    rets = [
-        pool.apply_async(
-            run_comm_vary,
-            args=(
-                tp_size,
-                pp_size,
-                i,
-                shape,
-                dtype,
-                op_name,
-                backend,
-                distributed_init_method,
-            ),
-        )
-        for i in range(tp_size)
-    ]
-    rets = _collect(pool, rets)      # each rank: (ok, worst_diff, worst_k)
-    atol = tolerance(op_name, dtype)
-    ok = all(r[0] for r in rets)  # every rank's every replay was allclose
-    worst = max(rets, key=lambda r: r[1])  # rank with the largest abs diff
-    worst_diff, worst_k = worst[1], worst[2]
-    logger.info(
-        f"[{backend}] {op_name} [cudagraph/varying]: {shape=} {dtype=} "
-        f"{'OK' if ok else 'FAIL'} (worst |diff|={worst_diff:.3g} atol={atol} @replay {worst_k})"
-    )
-    return ok, worst_diff, worst_k, atol
-
-
-# ── ONE driver, and the timeout that makes a hang REPORTABLE ──
-
-# A case that has not answered in this long is hung, not slow. The whole matrix at its largest
-# shape ran in well under a minute per case when it worked, so this is generous by an order of
-# magnitude and still catches the failure it exists for. Without it a deadlocked case sits until
-# gk's 4h workload deadline and the run reports nothing at all -- which is what happened on
-# 2026-08-17 (killed at 30min by gloo's own timeout) and again on 2026-08-18 (killed by hand at 8min).
 def run_case(case: Case, world: int = 8, pp: int = 1) -> Outcome:
     """Run ONE case across `world` ranks. THE boundary: the only place a case failure is caught.
 
+    Was two drivers (one per input policy) that each spawned a pool, aggregated, and formatted a
+    verdict differently. Now one: spawn, collect under a timeout, take the WORST rank's numbers.
+
     It catches rather than propagates because a per-case failure must not abandon the cases after
     it -- the summary is the deliverable, and one backend's bug must not hide another's. Everything
-    below this raises normally (the pythonic default); this is the one seam that turns an exception
-    into a recorded outcome, including a TIMEOUT, so a deadlocked case is reported instead of
-    stalling the run silently.
+    below raises normally; this seam turns an exception into a recorded outcome, a TIMEOUT included,
+    so a deadlocked case is reported instead of stalling the run silently.
     """
     init = get_distributed_init_method("127.0.0.1", get_open_port())
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    pool = Pool(processes=world)
     try:
-        if case.mode == "cudagraph":
-            ok, worst, at, atol = test_communicator_vary(
-                world, pp, case.shape, case.dtype, case.op, case.backend, init)
-        else:
-            ok, worst, atol = test_communicator(
-                world, pp, case.shape, case.dtype, case.op, case.backend, init)
-            at = -1
-        return Outcome(case=case, measured=Measurement(worst_diff=worst, worst_at=at, atol=atol))
+        rets = [pool.apply_async(run_rank, args=(r, world, pp, case, init)) for r in range(world)]
+        pool.close()
+        per_rank = _collect(pool, rets)
     except BaseException as exc:       # noqa: BLE001 -- a case failure is data, not a crash
         return Outcome(case=case, failure=exc)
+
+    # EVERY rank's verdict, reduced to the worst. A collective's bug is often visible on only a
+    # subset of ranks (a distance/topology effect), so one rank's view is a single data point --
+    # the case passes only if every rank passed.
+    ok = all(r[0] for r in per_rank)
+    _, worst_diff, worst_at, atol = max(per_rank, key=lambda r: r[1])
+    return Outcome(case=case, measured=Measurement(within_tolerance=ok, worst_diff=worst_diff,
+                                                   worst_at=worst_at, atol=atol))
 
 
 def _detail(o: Outcome) -> str:
