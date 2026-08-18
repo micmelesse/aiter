@@ -22,13 +22,16 @@ the dropped/stale all_gather race the identical-input loop misses.
 
 import argparse
 import logging
+import os
+import shlex
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
 from multiprocessing import Pool, set_start_method
-from typing import List, Sequence, Tuple
+from typing import List, Mapping, Sequence, Tuple
 from typing_extensions import Optional
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -549,8 +552,13 @@ def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Outco
                                                    worst_at=worst_at, atol=atol))
 
 
-def parse(argv: Optional[Sequence[str]] = None) -> Plan:
-    """PARSE: argv in -> the Plan it names, out. Reads argv and the machine, nothing else.
+def parse(argv: Optional[Sequence[str]] = None,
+          environ: Optional[Mapping[str, str]] = None) -> Plan:
+    """PARSE: argv in -> the Plan it names, out. Reads argv, the environment and the machine.
+
+    `argv` None under pytest, where there is none -- the matrix then comes from `COMMS_ARGS`, the
+    same variable the workload declares, so the run is spelled ONE way whichever entry point starts
+    it. Both are read HERE and nowhere else.
 
     It resolves the rendezvous port here rather than per case: finding a free one is a read of the
     machine, and every such read belongs in this phase. One port serves the run because the cases
@@ -558,6 +566,9 @@ def parse(argv: Optional[Sequence[str]] = None) -> Plan:
 
     It touches nothing under test -- no communicator is built here.
     """
+    env = os.environ if environ is None else environ
+    if argv is None:
+        argv = shlex.split(env.get("COMMS_ARGS", ""))
     args = parser.parse_args(argv)
     return Plan(
         cases=cases(
@@ -594,8 +605,11 @@ def admission_divergences(world: int) -> List[str]:
                   fully_connected=True, max_size=_DEFAULT_MAX_SIZE)
     ours = _attrs(object.__new__(TorchCommunicator), disabled=False, world_size=world,
                   max_size=_DEFAULT_MAX_SIZE)
-    # ON the boundaries and one element either side, where an off-by-one hides.
-    edges = (16, 512, 1 << 20, _DEFAULT_MAX_SIZE // (world * 2), _DEFAULT_MAX_SIZE, 8192 * 8192)
+    # Every power of two across the range PLUS the current boundaries and one element either side.
+    # Boundaries alone are not enough: they are the edges of the rules as they are now, so a wrong
+    # rule that diverges in the band BETWEEN two of them shows up on neither.
+    edges = tuple(1 << k for k in range(4, 28)) + (
+        _DEFAULT_MAX_SIZE // (world * 2), _DEFAULT_MAX_SIZE, 8192 * 8192)
     out: List[str] = []
     for dtype in (torch.float16, torch.bfloat16):
         es = torch.empty(0, dtype=dtype).element_size()
@@ -625,13 +639,6 @@ def run(plan: Plan) -> Report:
     if plan.list_only:
         return Report(())
 
-    # Refuse to measure arms that do not take the same work. This is a correctness gate on the
-    # EXPERIMENT rather than on a backend, so it runs before any case and stops the run.
-    if diverged := admission_divergences(plan.world):
-        raise SystemExit(
-            "admission no longer matches CustomAllreduce, so the arms would route different work "
-            "and these numbers would compare routing:\n  " + "\n  ".join(diverged))
-
     outcomes: List[Outcome] = []
     for i, case in enumerate(plan.cases, 1):
         print(f"[{i}/{len(plan.cases)}] {case}", flush=True)
@@ -652,6 +659,22 @@ def emit(report: Report) -> int:
     elif report.outcomes:
         print(f"\nall {len(report.outcomes)} case(s) within tolerance", flush=True)
     return report.exit_code
+
+
+@pytest.mark.parametrize("world", (2, 4, 8))
+def test_admission_matches_the_baseline(world: int) -> None:
+    """Every backend admits exactly what `CustomAllreduce` does -- see `admission_divergences`.
+
+    Needs no GPU, so it holds the property the matrix below depends on even where the matrix cannot
+    run."""
+    assert admission_divergences(world) == []
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="the matrix is a multi-rank collective; it needs the GPUs")
+def test_the_correctness_matrix() -> None:
+    """THE run: every backend x op x dtype x shape x mode, from `COMMS_ARGS`."""
+    assert main() == 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
