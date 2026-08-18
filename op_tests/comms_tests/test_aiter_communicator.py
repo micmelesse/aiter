@@ -485,9 +485,8 @@ parser.add_argument(
     "-b",
     "--backend",
     type=str,
-    choices=list(BACKENDS),
     default=None,
-    help="run only this backend (default: all of them)",
+    help=f"comma-separated subset of {','.join(BACKENDS)} (default: all, in that order)",
 )
 
 
@@ -502,7 +501,16 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
-    backends = [args.backend] if args.backend else list(BACKENDS)
+    if args.backend:
+        backends = [b.strip() for b in args.backend.split(",") if b.strip()]
+        unknown = [b for b in backends if b not in BACKENDS]
+        if unknown:
+            raise SystemExit(f"unknown backend(s) {unknown}; known: {list(BACKENDS)}")
+        # Keep BACKENDS' order whatever order was typed, so the control still runs first and a
+        # harness failure is distinguishable from a backend failure.
+        backends = [b for b in BACKENDS if b in backends]
+    else:
+        backends = list(BACKENDS)
     print(f"backends: {backends}")
 
     # Every backend, every collective, identical-input eager then cudagraph capture +
