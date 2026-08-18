@@ -26,6 +26,7 @@ import os
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
+from unittest.mock import patch
 from multiprocessing import Pool, freeze_support, set_start_method
 from typing import List, Sequence, Tuple
 from typing_extensions import Optional
@@ -93,16 +94,18 @@ _BACKEND_CLASS = {
 # Subset with `-b`.
 BACKENDS = ("torch", "hip", "iris")
 
+# The known-good reference: first in BACKENDS so it runs first, named here so the one place that
+# treats it specially does not hardcode the string.
+CONTROL = BACKENDS[0]
+
 
 # ── THE DOMAIN: one type, one generator ──
 # What this suite explores is a TYPE, not four module-level lists read in a five-deep nest. A
 # reader answers "what does this cover" from `Case` and `cases()` alone, and one failing case is
 # nameable, so re-running exactly it is possible.
 #
-# NOT `@given`: our default is property-first (CONTRIBUTING *Property tests by default*), and this
-# is the stated distributed exception -- Hypothesis cannot drive across spawned ranks and each
-# shrink step would be a full 8-process run, so the sweep is hand-coded (CONTRIBUTING *Shrink and
-# bisect the input axis*). The domain is small and enumerated on purpose.
+# Enumerated rather than property-generated: a shrinking framework cannot drive across spawned
+# ranks, and each candidate would be a full 8-process run.
 
 # TWO modes, not three. `graph` ALWAYS varies the input across replays, because the
 # identical-input variant could not catch the bug this suite exists for: if replay k+1 reads k's
@@ -120,8 +123,6 @@ MODES = ("eager", "graph")
 class Case:
     """ONE unit of work: which backend, which collective, at what dtype and shape, replayed how.
 
-    `mode` is the axis that used to be duplicated code -- `eager`/`graph` went through one
-    driver and `varying` through a near-identical second one.
     """
 
     backend: str
@@ -177,6 +178,18 @@ class Outcome:
             return "ERROR"
         return "OK" if self.ok else "FAIL"
 
+    @property
+    def message(self) -> str:
+        """What this case knows. A hung one has no diff, and `worst|diff|=0` would read as a pass."""
+        if self.hung:
+            return f"no answer in {CASE_TIMEOUT_S}s"
+        if self.failure is not None:
+            return f"{type(self.failure).__name__}: {self.failure}"
+        m = self.measured
+        assert m is not None            # no failure and no measurement is unrepresentable
+        at = f" @replay {m.worst_at}" if m.worst_at >= 0 else ""
+        return f"worst|diff|={m.worst_diff:.3g} atol={m.atol}{at}"
+
 
 def cases(backends: Sequence[str], ops: Sequence[str], dts: Sequence["torch.dtype"],
           shapes: Sequence[Tuple[int, ...]], modes: Sequence[str] = MODES) -> List[Case]:
@@ -209,41 +222,6 @@ def _build_communicator(backend, cpu_group, device_group, device):
     return comm
 
 
-def check_backend_selection():
-    """The selector's contract, with no GPU and no process group: every known name maps
-    to its own class, an unknown name RAISES, and there is no default.
-
-    Cheap and first, because the failure it catches is the expensive kind -- a silently
-    wrong backend does not crash, it returns numbers for something you did not ask for.
-    """
-    for name, cls in _BACKEND_CLASS.items():
-        assert name in _BACKEND_CLASS and cls is not None
-    # distinct classes: a copy-paste in the factory that points two names at one impl
-    # would make two "different" arms the same measurement.
-    assert len(set(_BACKEND_CLASS.values())) == len(_BACKEND_CLASS)
-
-    for bad in ("hpi", "Iris ", "", "nccl"):
-        try:
-            make_communicator(None, None, 0, backend=bad)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"backend {bad!r} was accepted; it must raise")
-
-    saved = os.environ.pop("AITER_COMMS_BACKEND", None)
-    try:
-        make_communicator(None, None, 0, backend=None)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("an unset backend must raise, never pick a default")
-    finally:
-        if saved is not None:
-            os.environ["AITER_COMMS_BACKEND"] = saved
-
-    logging.info("backend selection OK: %s", ", ".join(sorted(_BACKEND_CLASS)))
-
-
 def _make_op(comm, op_name, x):
     """The collective under test as a zero-arg closure over the rank's input,
     after enforcing the communicator's own should_* precondition."""
@@ -270,10 +248,8 @@ CASE_TIMEOUT_S = 600
 def _collect(pool, rets):
     """Every rank's result, or raise `mp.TimeoutError` once `CASE_TIMEOUT_S` is up.
 
-    THE reason this exists rather than `pool.join()`: join waits forever. On 2026-08-18 all eight
-    ranks deadlocked inside `destroy_process_group` and the driver sat in join with nothing printed
-    for eight minutes. `AsyncResult.get(timeout=...)` is what makes a hang a reportable outcome, and
-    `terminate()` is what stops the ranks so the next case can have the GPUs.
+    `pool.join()` cannot be used here: it waits forever, so a deadlocked rank stalls the whole run
+    with nothing printed. `terminate()` frees the GPUs for the next case.
     """
     deadline = time.monotonic() + CASE_TIMEOUT_S
     out = []
@@ -310,10 +286,9 @@ def _run_eager(op, inputs, static_in):
 def _run_graph(op, inputs, static_in):
     """Capture once, then replay with a FRESH input each time. One output per replay.
 
-    The graph is a LOCAL of this function, so it is freed when this returns -- which is what makes
-    the teardown deadlock structurally impossible rather than fixed by a remembered `del`. A live
-    captured graph holds the NCCL communicator's work, and `destroy_process_group` then blocks
-    draining work the graph still owns: on 2026-08-18 all eight ranks sat in it for eight minutes.
+    The graph is a LOCAL, so it is freed when this returns -- which must happen BEFORE the process
+    group is destroyed. A live captured graph holds the communicator's work, and
+    `destroy_process_group` then blocks forever draining work the graph still owns.
 
     Only a cheap snapshot copy sits between replays so they stay back-to-back; an elided end barrier
     needs that to race. All checking happens after a single sync.
@@ -384,11 +359,8 @@ def _judge(op_name, dtype, all_inputs, got):
 def run_rank(rank, world, pp, case, init_method):
     """ONE per-rank worker for EVERY case. Bring up, run the mode, judge, tear down.
 
-    Was two near-identical functions (63L and 100L, 65% the same lines) split by whether the input
-    varied -- which is why the teardown bug existed in both copies and had to be fixed twice. The
-    only difference was WHERE the comparison happened, and that is gone: every rank rebuilds every
-    rank's input from a seed, so every rank judges its own replays and returns a verdict. Nothing
-    but scalars crosses the process boundary now.
+    Every rank rebuilds every rank's input from a seed, so it can compute the reference itself and
+    judge its own replays. Only scalars cross the process boundary.
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -422,26 +394,21 @@ def run_rank(rank, world, pp, case, init_method):
     return verdict
 
 
-def run_case(case: Case, world: int = 8, pp: int = 1, addr: str = "127.0.0.1",
-             port: int = 0) -> Outcome:
+def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Outcome:
     """Run ONE case across `world` ranks. THE boundary: the only place a case failure is caught.
 
-    Was two drivers (one per input policy) that each spawned a pool, aggregated, and formatted a
-    verdict differently. Now one: spawn, collect under a timeout, take the WORST rank's numbers.
+    Spawn, collect under a timeout, take the worst rank's numbers.
 
-    It catches rather than propagates because a per-case failure must not abandon the cases after
-    it -- the summary is the deliverable, and one backend's bug must not hide another's. Everything
-    below raises normally; this seam turns an exception into a recorded outcome, a TIMEOUT included,
-    so a deadlocked case is reported instead of stalling the run silently.
+    It CATCHES rather than propagates because a per-case failure must not abandon the cases after
+    it: the summary is the deliverable, and one backend's bug must not hide another's. Everything
+    below raises normally; this is the one seam that turns an exception -- a timeout included -- into
+    a recorded outcome.
     """
-    # The rendezvous, and the ONLY channel for it: `tcp://<addr>:<port>`, passed to every rank.
-    # `MASTER_ADDR`/`MASTER_PORT` used to be set here too, the port hardcoded to 49373 while the
-    # init method got a free one -- two different ports for one rendezvous. They were also DEAD:
-    # nothing in `aiter/dist/` reads either, and torch only consults them for `init_method="env://"`,
-    # which this never uses. A hardcoded port is a collision between two runs on a shared box, so
-    # the fix is one source of truth that defaults to a FREE port per case.
+    # The rendezvous, and the ONLY channel for it. Deliberately not `MASTER_ADDR`/`MASTER_PORT`:
+    # nothing in `aiter.dist` reads those, and torch consults them only for `init_method="env://"`.
+    # A free port per case is what keeps two runs on a shared box from colliding.
     pool = Pool(processes=world)
-    init = get_distributed_init_method(addr, port or get_open_port())
+    init = get_distributed_init_method(addr, port)
     try:
         rets = [pool.apply_async(run_rank, args=(r, world, pp, case, init)) for r in range(world)]
         pool.close()
@@ -458,93 +425,123 @@ def run_case(case: Case, world: int = 8, pp: int = 1, addr: str = "127.0.0.1",
                                                    worst_at=worst_at, atol=atol))
 
 
-def _detail(o: Outcome) -> str:
-    """What one outcome actually knows. A hung case has no diff, and printing `worst|diff|=0` for
-    one would read as a passing measurement."""
-    if o.hung:
-        return f"no answer in {CASE_TIMEOUT_S}s"
-    if o.failure is not None:
-        return f"{type(o.failure).__name__}: {o.failure}"
-    m = o.measured
-    assert m is not None                      # no failure and no measurement is unrepresentable
-    at = f" @replay {m.worst_at}" if m.worst_at >= 0 else ""
-    return f"worst|diff|={m.worst_diff:.3g} atol={m.atol}{at}"
-
-
 @dataclass(frozen=True)
 class Report:
-    """A finished run: what every case did, plus the ONE conclusion drawn from them.
-
-    Essential, not an intermediate: `outcomes` alone does not say whether the run passed, because
-    that depends on WHICH case failed (a control failure invalidates the table; a backend failure
-    does not). The conclusion is the thing a reader wants and the thing the exit code encodes.
-    """
+    """A finished run: what every case did, and what that means for the run as a whole."""
 
     outcomes: Sequence[Outcome]
-    problem: Optional[str]          # None when everything required passed
+
+    @property
+    def failures(self) -> List[Outcome]:
+        return [o for o in self.outcomes if not o.ok]
+
+    @property
+    def conclusion(self) -> Optional[str]:
+        """The run's ONE conclusion, or None if every case passed.
+
+        CONTROL FIRST and separately: the control backend is known-good, so it failing means the
+        HARNESS is unsound and every other line in the table is worthless -- a different message
+        from a backend bug.
+        """
+        bad = self.failures
+        if not bad:
+            return None
+        ctrl = [o for o in bad if o.case.backend == CONTROL]
+        if ctrl:
+            return (f"CONTROL FAILED: {CONTROL} is wrong or hung under this harness "
+                    f"({ctrl[0].case} -- {ctrl[0].message}). The harness is unsound; no other "
+                    f"verdict in the table can be trusted.")
+        hung = [o for o in bad if o.hung]
+        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
+        return (f"{lead}{len(bad)} of {len(self.outcomes)} case(s) failed (control passed, so "
+                f"these are real backend bugs): "
+                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
 
     @property
     def exit_code(self) -> int:
-        return 1 if self.problem else 0
+        return 1 if self.conclusion else 0
 
 
-def run(argv: Optional[Sequence[str]] = None) -> List[Outcome]:
-    """READ: argv and the world it names, in -> one Outcome per case, out.
+@dataclass(frozen=True)
+class Plan:
+    """WHAT to run and HOW: the cases, plus the parameters every case shares.
 
-    Everything that touches the outside lives here: the flags, the GPUs, the spawned ranks. It
-    prints per-case progress as it goes, which is emission inside the read phase and deliberate --
-    a case that hangs must have named itself BEFORE it hung, or the log cannot say which one did.
+    The output of `parse` and the input to `run`, so "did these flags produce the cases I meant" is
+    answerable without a GPU.
+    """
+
+    cases: Sequence[Case]
+    world: int
+    addr: str
+    port: int                       # RESOLVED by `parse`, so no case reaches for one later
+    list_only: bool
+
+
+def parse(argv: Optional[Sequence[str]] = None) -> Plan:
+    """PARSE: argv in -> the Plan it names, out. Reads argv and the machine, nothing else.
+
+    It resolves the rendezvous port here rather than per case: finding a free one is a read of the
+    machine, and every such read belongs in this phase. One port serves the run because the cases
+    are sequential, each tearing its process group down before the next starts.
+
+    It touches nothing under test -- no communicator is built here.
     """
     args = parser.parse_args(argv)
-
-    # Cheap and first, before any GPU: a silently wrong backend does not crash, it returns numbers
-    # for something you did not ask for.
-    check_backend_selection()
-
-    backends = _pick(args.backend, BACKENDS, "backend")
-    modes = _pick(args.mode, MODES, "mode")
-    dts = [dtypes.d_dtypes[args.dtype]] if args.dtype else [dtypes.d_dtypes[k] for k in l_dtype]
-    shapes = [args.shape] if args.shape else list(l_shape)
-    plan = cases(backends, OPS, dts, shapes, modes)
-
-    print(f"world={args.world}  rendezvous={args.addr}:{args.port or 'free'}  "
-          f"backends={backends}  modes={list(modes)}  dtypes={[str(d) for d in dts]}  "
-          f"shapes={shapes}")
-    print(f"{len(plan)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
-    if args.list:
-        for i, case in enumerate(plan, 1):
-            print(f"  {i:3}  {case}")
-        return []
-
-    outcomes: List[Outcome] = []
-    for i, case in enumerate(plan, 1):
-        print(f"[{i}/{len(plan)}] {case}", flush=True)
-        o = run_case(case, world=args.world, addr=args.addr, port=args.port)
-        print(f"      -> {o.label:5}  {_detail(o)}", flush=True)
-        outcomes.append(o)
-    return outcomes
+    return Plan(
+        cases=cases(
+            _pick(args.backend, BACKENDS, "backend"), OPS,
+            [dtypes.d_dtypes[args.dtype]] if args.dtype
+            else [dtypes.d_dtypes[k] for k in l_dtype],
+            [args.shape] if args.shape else list(l_shape),
+            _pick(args.mode, MODES, "mode"),
+        ),
+        world=args.world,
+        addr=args.addr,
+        port=get_open_port() if args.port is None else args.port,
+        list_only=args.list,
+    )
 
 
-def judge(outcomes: Sequence[Outcome], control: str = "torch") -> Report:
-    """COMPUTE: outcomes in -> the run's conclusion, out. Pure, total, no I/O.
+def check_selector() -> None:
+    """The selector's contract, before any case spends a GPU on it.
 
-    CONTROL FIRST, and separately from everything else: `torch` is known-good, so it failing means
-    the HARNESS is unsound and every other line in the table is worthless. That is a different
-    message from a backend bug, and conflating the two once cost a day of chasing the wrong thing.
+    Two things no case can check: that an unknown name RAISES (cases only pass valid ones), and that
+    distinct names build distinct classes -- a copy-paste pointing two at one impl would silently
+    make two "different" arms the same measurement. `None` counts as unknown, and since
+    `make_communicator` reads AITER_COMMS_BACKEND for that case, it is checked against an EMPTY
+    environment.
     """
-    bad = [o for o in outcomes if not o.ok]
-    ctrl = [o for o in bad if o.case.backend == control]
-    if ctrl:
-        return Report(outcomes, f"CONTROL FAILED: {control} is wrong or hung under this harness "
-                                f"({ctrl[0].case} -- {_detail(ctrl[0])}). The harness is unsound; "
-                                f"no other verdict in the table can be trusted.")
-    if bad:
-        hung = [o for o in bad if o.hung]
-        lead = f"{len(hung)} case(s) HUNG; " if hung else ""
-        return Report(outcomes, f"{lead}{len(bad)} of {len(outcomes)} case(s) failed (control "
-                                f"passed, so these are real backend bugs): "
-                                + "; ".join(f"{o.case} [{o.label}]" for o in bad))
-    return Report(outcomes, None)
+    assert len(set(_BACKEND_CLASS.values())) == len(_BACKEND_CLASS), "two names, one impl"
+    with patch.dict(os.environ, {}, clear=True):
+        for bad in (None, "hpi", "Iris ", "", "nccl"):
+            try:
+                make_communicator(None, None, 0, backend=bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"backend {bad!r} was accepted; it must raise")
+
+
+def run(plan: Plan) -> Report:
+    """RUN: a Plan in -> a Report out. Everything that touches the code under test lives here.
+
+    It prints as it goes, which is emission inside the doing phase and deliberate: a case that
+    hangs must have named itself BEFORE it hung, or the log cannot say which one did.
+    """
+    print(f"world={plan.world}  rendezvous={plan.addr}:{plan.port}  "
+          f"{len(plan.cases)} case(s), timeout {CASE_TIMEOUT_S}s each", flush=True)
+    for i, case in enumerate(plan.cases, 1):
+        print(f"  {i:3}  {case}")
+    if plan.list_only:
+        return Report(())
+
+    check_selector()
+    outcomes: List[Outcome] = []
+    for i, case in enumerate(plan.cases, 1):
+        print(f"[{i}/{len(plan.cases)}] {case}", flush=True)
+        o = run_case(case, world=plan.world, addr=plan.addr, port=plan.port)
+        print(f"      -> {o.label:5}  {o.message}", flush=True)
+        outcomes.append(o)
+    return Report(outcomes)
 
 
 def emit(report: Report) -> int:
@@ -552,23 +549,21 @@ def emit(report: Report) -> int:
     if report.outcomes:
         print("\n==== correctness summary ====")
         for o in report.outcomes:
-            print(f"  [{o.label:5}] {o.case}  {_detail(o)}")
-    if report.problem:
-        print(f"\n{report.problem}", flush=True)
+            print(f"  [{o.label:5}] {o.case}  {o.message}")
+    if report.conclusion:
+        print(f"\n{report.conclusion}", flush=True)
     elif report.outcomes:
         print(f"\nall {len(report.outcomes)} case(s) within tolerance", flush=True)
     return report.exit_code
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """READ, then COMPUTE, then EMIT -- and nothing else, so the whole program is one line.
+    """PARSE, RUN, EMIT -- and nothing else, so the whole program is one line.
 
-    The phases are the shape, not a description of it (CONTRIBUTING *In code we own but SHIP
-    elsewhere*). This replaced a 107-line `__main__` block that inlined two five-deep loop nests,
-    its own progress counters, its own summary formatting and its own verdict logic, so none of the
-    three could be read or changed independently.
+    Read the command line, do the work, say what happened. Drawing the conclusion is part of doing
+    the work, so it is a helper inside `run` rather than a phase of its own.
     """
-    return emit(judge(run(argv)))
+    return emit(run(parse(argv)))
 
 
 def _pick(raw: Optional[str], known: Sequence[str], what: str) -> List[str]:
@@ -615,9 +610,9 @@ parser.add_argument(
 parser.add_argument(
     "--port",
     type=int,
-    default=0,
-    help="rendezvous port; 0 (default) picks a FREE one per case, so two runs on a shared box "
-         "cannot collide. Pin it only to debug a specific rendezvous.",
+    default=None,
+    help="rendezvous port. Omitted (the default) picks a FREE one per case, so two runs on a "
+         "shared box cannot collide. Pin it only to debug a specific rendezvous.",
 )
 parser.add_argument(
     "-l",
