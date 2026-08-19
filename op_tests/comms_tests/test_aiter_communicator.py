@@ -8,11 +8,13 @@ gen_inputs -> run_collective -> expected_outputs -> compare.
 
 The modes localise a failure rather than covering different ground: `eager` asks whether the
 collective is right at all, `graph` whether capture/replay preserves that across many replays with
-fresh input, `vllm` whether the real pattern works: a collective per layer, captured into more than
-one graph under a single registration, replayed round-robin, with an eager fallback in the middle.
+fresh input, `vllm` whether the real pattern works: a collective per layer, EVERY shape captured
+together under one registration -- vLLM's capture-size ladder, sharing one set of buffers -- replayed
+round-robin, with an eager fallback in the middle.
 """
 
 import logging
+import math
 from functools import partial
 from itertools import product
 from dataclasses import dataclass
@@ -50,6 +52,7 @@ set_start_method("spawn", force=True)
 
 # Back-to-back with no inter-replay sync is what stresses an elided end barrier; a per-replay sync
 # would hide the race. 200 because each replay also keeps a snapshot, and a stale read shows early.
+# It is the budget for a whole GROUP: shapes captured together divide it rather than each taking 200.
 GRAPH_REPLAYS = 200
 
 
@@ -137,14 +140,16 @@ DTYPES = ("fp16", "bf16")
 # [tokens, 8192] is what vLLM hands a TP=8 all-reduce. 511/512 straddle the 8 MiB admission bound,
 # where the communicator starts declining and vLLM falls back; 4088 is deliberately not a power of two.
 SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
+# They differ in the LEADING dimension only, asserted here because here is where the literal is. A
+# group of shapes shares one set of buffers sized to the tallest and each reads a PREFIX (see
+# `run_collective`), which is valid only under this. vLLM's capture sizes differ in tokens and share
+# the hidden size, so the ladder is faithful exactly while this holds -- and at import, before a
+# process is spawned or a card touched, is the cheapest place to find out that it stopped.
+assert len({sh[1:] for sh in SHAPES}) == 1, f"SHAPES may differ only in the leading dim: {SHAPES}"
 
-# `vllm` is a superset of `graph`: same replay depth, plus one collective per layer in one capture,
-# captured into more than one graph and replayed round-robin.
+# `vllm` is a superset of `graph`: one collective per layer, and every shape captured TOGETHER --
+# vLLM's capture-size ladder -- rather than a capture per shape.
 VLLM_LAYERS = 8
-# vLLM captures a graph per batch size -- dozens -- inside ONE capture context, then replays whichever
-# one the incoming batch matches. TWO is the smallest number that makes those two facts true: a
-# registration covering more than one graph, and a replay that is not always the last graph captured.
-VLLM_GRAPHS = 2
 
 # The share of one card a single case may need for its inputs and snapshots. Multi-GPU runs OWN the
 # machine (coordinated beforehand), so a case may take most of a card -- but not so much that the
@@ -155,25 +160,25 @@ MEMORY_BUDGET = 0.70
 @dataclass(frozen=True)
 class Schedule:
     buffers: int        # distinct input buffers the collective is called on, per replay
-    graphs: int         # graphs the body is captured into, replayed round-robin; 0 runs it eagerly
-    replays: int        # how many times the body runs
+    shapes: int         # shapes sharing ONE capture; 1 gives each its own, as vLLM does not
+    replays: int        # body launches, SHARED by every shape in the group
+    captured: bool      # recorded into cudagraphs -- one per shape -- and replayed, or run eagerly
 
-    @property
-    def captured(self) -> bool:
-        """Eager is `graphs=0`. There is no third state, so ONE field says which mode this is and a
-        `captured` flag that could disagree with `graphs` cannot exist."""
-        return self.graphs > 0
+    def slots(self, admitted: int) -> int:
+        """Collectives ONE shape sees, and the index space its inputs and its judging share.
 
-    @property
-    def slots(self) -> int:
-        """Total collectives, and the index space the inputs and the judging share."""
-        return self.buffers * self.replays
+        `replays` is the budget for the whole GROUP, so the shapes that share a capture share it too:
+        adding a shape to the ladder must not multiply the snapshots, which at `all_gather`'s
+        eight-fold fan-out is what decides whether the group fits on a card at all. Truncated, so every
+        shape gets the SAME count and the arithmetic is identical for all of them.
+        """
+        return self.buffers * max(1, self.replays // admitted)
 
 
 SCHEDULES = {
-    "eager": Schedule(buffers=1, graphs=0, replays=1),
-    "graph": Schedule(buffers=1, graphs=1, replays=GRAPH_REPLAYS),
-    "vllm": Schedule(buffers=VLLM_LAYERS, graphs=VLLM_GRAPHS, replays=GRAPH_REPLAYS),
+    "eager": Schedule(buffers=1, shapes=1, replays=1, captured=False),
+    "graph": Schedule(buffers=1, shapes=1, replays=GRAPH_REPLAYS, captured=True),
+    "vllm": Schedule(buffers=VLLM_LAYERS, shapes=len(SHAPES), replays=GRAPH_REPLAYS, captured=True),
 }
 MODES = tuple(SCHEDULES)
 
@@ -280,9 +285,10 @@ def gen_inputs(shape: Tuple[int, ...], dtype: torch.dtype, world: int, slots: in
     """THE one source of input: every rank's tensor for every slot, as `[rank][slot]`.
 
     A cycled POOL of `INPUT_POOL` distinct tensors, not one per slot: what a replay must detect is a
-    read of the PREVIOUS slot's data, so consecutive slots differing is what matters, not all 1600
-    being unique. Per-slot interface, per-pool memory -- 1 GiB rather than 100 at `vllm`'s 1600 slots,
-    which is what lets every shape run in every mode.
+    read of the PREVIOUS slot's data, so consecutive slots differing is what matters, not all 400
+    being unique. Per-slot interface, per-pool memory -- and it is per SHAPE, so the whole `vllm`
+    ladder's inputs cost 16 tensors a shape rather than 400, which is what lets every shape run in
+    every mode.
     """
     pool = min(slots, INPUT_POOL)
     made = [[_one_input(r, j, shape, dtype).to(device) for j in range(pool)] for r in range(world)]
@@ -296,94 +302,133 @@ def _one_input(rank: int, k: int, shape: Tuple[int, ...], dtype: torch.dtype) ->
     return torch.randn(shape, generator=g).to(dtype)
 
 
-def precheck(comm: Communicator, op_name: str, shape: Tuple[int, ...], dtype: torch.dtype,
-             world: int, sched: Schedule, budget: int) -> Tuple[None, Optional[str]]:
-    """`(None, why)` if this cell will not run, `(None, None)` if it will. Neither reason is a failure.
+def _chunks(shapes: Sequence[Tuple[int, ...]], size: int) -> List[List[Tuple[int, ...]]]:
+    """`shapes` in groups of `size`, a group being what ONE capture covers. `size=1` is a capture per
+    shape; `size=len(shapes)` is vLLM's ladder, every size captured under one registration."""
+    return [list(shapes[i:i + size]) for i in range(0, len(shapes), size)]
 
-    ALWAYS the tuple, even with no value to return: the pair IS the signal that a function can fail.
-    A bare `-> Optional[str]` cannot say that -- a reader has to open the docstring to learn the string
-    is an error rather than a result. Python has no void, so `None` fills the value slot.
 
-    A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, a pool
-    each for inputs and expectations, and every graph's live outputs -- so it duplicates their knowledge
-    and can go stale. Under-counting OOMs, over-counting skips a cell that would have fit; counting two
-    of the terms is how it once passed a cell that then OOM'd.
+def declined(comm: Communicator, op_name: str, shape: Tuple[int, ...],
+             dtype: torch.dtype) -> Optional[str]:
+    """Why the communicator will not take `shape`, or None if it will.
+
+    A bare Optional, NOT `(value, err)`: there is no value, and a refusal is the ANSWER rather than the
+    failure of one -- `(512, 8192)` is in the list precisely to be refused. `(value, err)` is for a
+    function that was asked to produce something and could not; this one was asked a question.
     """
     one = torch.empty(shape, dtype=dtype)
     if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
-        return None, "declined by the communicator"
-    per = one.numel() * one.element_size()
-    fan = _expected(op_name, [one] * world).numel() // one.numel()
-    pool = min(sched.slots, INPUT_POOL)
-    # A snapshot per slot, a pool each for inputs and expectations, and the live outputs of every
-    # graph -- `or 1` because eager has no graph but still holds one body's worth.
-    live = sched.buffers * (sched.graphs or 1)
-    need = sched.slots * per * fan + pool * per * world + pool * per * fan + live * per * fan
+        return "declined by the communicator"
+    return None
+
+
+def precheck(op_name: str, shapes: Sequence[Tuple[int, ...]], dtype: torch.dtype,
+             world: int, sched: Schedule, budget: int) -> Tuple[None, Optional[str]]:
+    """`(None, why)` if this group will not run, `(None, None)` if it will. Not a failure either way.
+
+    ALWAYS the tuple, even with no value to return: the pair IS the signal that a function can fail.
+    A bare `-> Optional[str]` cannot say that -- a reader has to open the docstring to learn the string
+    is an error rather than a result. Python has no void, so `None` fills the value slot. Contrast
+    `declined` above, where the string is the answer and the bare Optional is right.
+
+    A GUARD, not a contract: `need` mirrors what the steps allocate -- per shape a snapshot per slot, a
+    pool each for inputs and expectations and one live output set per graph, plus ONE set of statics
+    shared by the whole group -- so it duplicates their knowledge and can go stale. Under-counting
+    OOMs, over-counting skips a group that would have fit; counting two of the terms is how it once
+    passed a cell that then OOM'd.
+    """
+    item = torch.empty(0, dtype=dtype).element_size()
+    probe = torch.empty(shapes[0], dtype=dtype)
+    fan = _expected(op_name, [probe] * world).numel() // probe.numel()
+    slots = sched.slots(len(shapes))
+    pool = min(slots, INPUT_POOL)
+    need = sum(item * math.prod(sh) * (slots * fan + pool * world + pool * fan + sched.buffers * fan)
+               for sh in shapes)
+    # The statics are SHARED by the group -- one set sized to the tallest shape, which every other
+    # shape reads a prefix of. See `run_collective`.
+    need += sched.buffers * item * math.prod(max(shapes, key=lambda sh: sh[0]))
     if need > budget:
         return None, f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
     return None, None
 
 
-def run_collective(comm: Communicator, op_name: str, mine: Sequence[torch.Tensor],
-                   sched: Schedule) -> List[torch.Tensor]:
-    """One output per SLOT: slot j is replay `j // buffers` on buffer `j % buffers`.
+def run_collective(comm: Communicator, op_name: str, mine: Sequence[Sequence[torch.Tensor]],
+                   sched: Schedule) -> List[List[torch.Tensor]]:
+    """One output per (shape, SLOT): `mine[s][j]` in, the result out. Slot j is replay `j // buffers`
+    on buffer `j % buffers`.
+
+    The shapes of one call SHARE their input buffers -- `buffers` allocations sized to the tallest, each
+    shape's launch reading a PREFIX, which `SHAPES` is asserted to permit. That is vLLM's arrangement
+    rather than a saving: its capture sizes are slices of one persistent activation buffer, so every
+    graph records a launch on the SAME address with a different length. Allocating per shape instead
+    would test something vLLM never does, and would hide the case where one address is registered once
+    per graph.
 
     The graphs are LOCALS and die here; a live one makes `destroy_process_group` block forever. The
     warmup runs EAGER on the same communicator, registering the staging buffer. Only a snapshot sits
     between replays, so they stay back-to-back -- an elided end barrier needs that to race.
     """
-    statics = [mine[m].clone() for m in range(sched.buffers)]
-    # `partial` on the API itself. Nothing re-checks admission: the communicator enforces its own
-    # envelope and raises, so a check here would restate what the callee guarantees.
-    ops = [partial(getattr(comm, op_name), st) for st in statics]
+    shapes = [tuple(m[0].shape) for m in mine]
+    n = len(shapes)
+    each = sched.slots(n) // sched.buffers          # replays THIS shape gets, the same for all of them
+    ref = mine[0][0]
+    statics = [torch.zeros((max(sh[0] for sh in shapes), *shapes[0][1:]),
+                           dtype=ref.dtype, device=ref.device) for _ in range(sched.buffers)]
+    # `partial` on the API itself, over the prefix VIEWS. Nothing re-checks admission: the communicator
+    # enforces its own envelope and raises, so a check here would restate what the callee guarantees.
+    ops = [[partial(getattr(comm, op_name), st[:sh[0]]) for st in statics] for sh in shapes]
 
-    def body() -> List[torch.Tensor]:
-        return [op() for op in ops]
+    def body(s: int) -> List[torch.Tensor]:
+        return [op() for op in ops[s]]
 
-    def feed(replay: int) -> None:
+    def feed(s: int, replay: int) -> None:
         for m, st in enumerate(statics):
-            st.copy_(mine[replay * sched.buffers + m])
+            st[:shapes[s][0]].copy_(mine[s][replay * sched.buffers + m])
 
     if not sched.captured:
-        out = []
-        for k in range(sched.replays):
-            feed(k)
-            out += [o.clone() for o in body()]
+        out: List[List[torch.Tensor]] = [[] for _ in shapes]
+        for k in range(each * n):
+            s, replay = k % n, k // n
+            feed(s, replay)
+            out[s] += [o.clone() for o in body(s)]
         return out
 
     for _ in range(3):          # eager warmup: first-call allocations, and the staging registration
-        body()
+        for s in range(n):
+            body(s)
     torch.cuda.synchronize()
-    # ONE capture context over EVERY graph, the way vLLM's covers every batch size it captures: the
-    # deferred registration then happens once for all of them, which is the path a real startup takes
-    # and the only place a registration wider than a single graph is exercised. The graphs are NOT
-    # given a shared pool -- the inputs the communicator sees are the statics, allocated before any
-    # capture, so sharing would change torch's bookkeeping and nothing the communicator observes.
-    graphs = [torch.cuda.CUDAGraph() for _ in range(sched.graphs)]
+    # ONE capture context over EVERY graph, the way vLLM's covers every capture size: the deferred
+    # registration then happens once for all of them, which is the path a real startup takes and the
+    # only place a registration wider than a single graph is exercised. The graphs are NOT given a
+    # shared pool -- what the communicator sees are the statics, allocated before any capture, so
+    # sharing would change torch's bookkeeping and nothing the communicator observes.
+    graphs = [torch.cuda.CUDAGraph() for _ in shapes]
     outs = []
     with comm.capture():
-        for g in graphs:
+        for s, g in enumerate(graphs):
             with torch.cuda.graph(g):
-                outs.append(body())
-    # Every graph records the same body, so one snapshot set indexed by replay covers all of them.
-    snaps = [torch.empty((sched.replays, *o.shape), dtype=o.dtype, device=o.device) for o in outs[0]]
-    for k in range(sched.replays):
-        feed(k)
-        # ROUND-ROBIN, not one graph every time: vLLM replays whichever graph the incoming batch
-        # matches, and alternating is what shows each graph got its OWN peer pointers rather than
-        # reading the set the last capture happened to leave behind.
-        which = k % sched.graphs
-        graphs[which].replay()
-        for m, o in enumerate(outs[which]):
-            snaps[m][k].copy_(o)
-        if sched.graphs > 1 and k == sched.replays // 2:
-            # An EAGER collective mid-replay, result DISCARDED. vLLM falls back to eager for a batch
-            # no graph matches, on this same communicator and after its graph buffers are registered.
-            # What is checked is not this result but that every replay after it is still right -- so
-            # it belongs to the mode that models vLLM, and `graph` stays the clean isolator.
-            body()
+                outs.append(body(s))
+    snaps = [[torch.empty((each, *o.shape), dtype=o.dtype, device=o.device) for o in outs[s]]
+             for s in range(n)]
+    for k in range(each * n):
+        s, replay = k % n, k // n
+        feed(s, replay)
+        # ROUND-ROBIN over the shapes, not one graph to exhaustion: vLLM replays whichever graph the
+        # incoming batch matches. Alternating is what shows each graph kept its OWN peer pointers, and
+        # it puts other shapes' work between a shape's consecutive replays -- a stale read has to
+        # survive that to go unnoticed.
+        graphs[s].replay()
+        for m, o in enumerate(outs[s]):
+            snaps[s][m][replay].copy_(o)
+        if n > 1 and k == (each * n) // 2:
+            # An EAGER collective mid-replay, result DISCARDED. vLLM falls back to eager for a batch no
+            # graph matches, on this same communicator and after its graph buffers are registered. What
+            # is checked is not this result but that every replay after it is still right -- so it
+            # belongs to the mode that models vLLM, and `graph` stays the clean isolator.
+            body(s)
     torch.cuda.synchronize()
-    return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs[0]))]
+    return [[snaps[s][m][replay] for replay in range(each) for m in range(sched.buffers)]
+            for s in range(n)]
 
 
 def expected_outputs(op_name: str, inputs: Sequence[Sequence[torch.Tensor]],
@@ -433,8 +478,12 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
 
     It owns the lifetime because construction and teardown are two of the ways a communicator fails --
     building one is a collective, and teardown releases IPC handles -- and owning both puts the order
-    beyond reach. A declined cell, or one past the memory budget, is reported and skipped: declining is
-    correct behaviour. Each cell is scoped so its tensors die with the frame.
+    beyond reach. A declined shape, or a group past the memory budget, is reported and skipped:
+    declining is correct behaviour. Each group is scoped so its tensors die with the frame.
+
+    A GROUP is the shapes one capture covers -- one shape for `eager` and `graph`, all of them for
+    `vllm`. They run together and are JUDGED APART, so the log keeps a line per (op, dtype, shape)
+    whichever mode produced it.
     """
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
     worst = Measurement(within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0, rtol=0.0)
@@ -443,33 +492,47 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
     # `del` only releases if nothing else holds a reference -- and a failing cell's traceback holds the
     # frames that hold the communicator, so `del` fails exactly when it matters.
     with _build_communicator(backend, cpu_group, group, device) as comm:
-        for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
+        for op_name, dtype_name in product(OPS, DTYPES):
             dtype = dtypes.d_dtypes[dtype_name]
-            where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
             atol = _atol(op_name, dtype)
+            for chunk in _chunks(SHAPES, sched.shapes):
+                # Admission FIRST and per shape, because a group is what the capture covers: a refused
+                # shape is dropped from it, not a reason to skip the ones that were admitted.
+                shapes = []
+                for sh in chunk:
+                    why = declined(comm, op_name, sh, dtype)
+                    if why is None:
+                        shapes.append(sh)
+                    else:
+                        _say(rank, f"      - {op_name:11} {dtype_name:5} {str(sh):12} {why}")
+                if not shapes:
+                    continue
 
-            def cell() -> Tuple[Optional[Measurement], Optional[str]]:
-                # THE ERROR TRACK is the second element, and it is the ONLY thing we test: `err is
-                # not None` means we have an error. Never the value -- when `err` is set the value slot
-                # is not to be read, and here there is no value at all.
-                _, err = precheck(comm, op_name, shape, dtype, world, sched, budget)
+                def cell() -> Tuple[Optional[List[Measurement]], Optional[str]]:
+                    # THE ERROR TRACK is the second element, and it is the ONLY thing we test: `err is
+                    # not None` means we have an error. Never the value -- when `err` is set the value
+                    # slot is not to be read.
+                    _, err = precheck(op_name, shapes, dtype, world, sched, budget)
+                    if err is not None:
+                        return None, err
+                    slots = sched.slots(len(shapes))
+                    inputs = [gen_inputs(sh, dtype, world, slots, device) for sh in shapes]
+                    got = run_collective(comm, op_name, [i[rank] for i in inputs], sched)
+                    expected = [expected_outputs(op_name, i, slots) for i in inputs]
+                    return [compare(g, e, atol, RTOL) for g, e in zip(got, expected)], None
+
+                # Same check, same track: `err is not None` means an error, and the value is only read
+                # once we know there was none.
+                got, err = cell()
                 if err is not None:
-                    return None, err
-                inputs = gen_inputs(shape, dtype, world, sched.slots, device)
-                got = run_collective(comm, op_name, inputs[rank], sched)
-                expected = expected_outputs(op_name, inputs, sched.slots)
-                return compare(got, expected, atol, RTOL), None
-
-            # Same check, same track: `err is not None` means an error, and `got` is only read once
-            # we know there was none.
-            got, err = cell()
-            if err is not None:
-                _say(rank, f"      - {where} {err}")
-                continue
-            _say(rank, f"      {where} {got}")
-            worst = worst.worse_of(got)
-            ran += 1
-            torch.cuda.empty_cache()
+                    _say(rank, f"      - {op_name:11} {dtype_name:5} "
+                               f"{len(shapes)} shapes together  {err}")
+                    continue
+                for sh, m in zip(shapes, got):
+                    _say(rank, f"      {op_name:11} {dtype_name:5} {str(sh):12} {m}")
+                    worst = worst.worse_of(m)
+                    ran += 1
+                torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     # COUNTED, because the seed verdict passes: a communicator that declined everything would
