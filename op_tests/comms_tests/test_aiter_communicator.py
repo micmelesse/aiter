@@ -44,10 +44,8 @@ logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
-# Replays for the `graph` case. Back-to-back with no inter-replay sync is what stresses an
-# elided end barrier (replay N+1 must not start before replay N's writes land); a per-replay sync
-# would hide the race. 200 rather than more because each replay also keeps a snapshot output buffer
-# (N x out-shape) and a stale read shows within the first few differing replays anyway.
+# Back-to-back with no inter-replay sync is what stresses an elided end barrier; a per-replay sync
+# would hide the race. 200 because each replay also keeps a snapshot, and a stale read shows early.
 GRAPH_REPLAYS = 200
 
 
@@ -56,16 +54,12 @@ CASE_TIMEOUT_S = 600
 # Deterministic per-(rank, replay) seed base for the varying-input check.
 _INPUT_SEED = 20260615
 
-# The admission parameters CustomAllreduce uses, RECORDED here. That is the path these backends
-# replace, so it is the envelope they have to match, and writing the numbers down is what makes the
-# match reviewable. aiter must not IMPORT vllm to get them -- vllm depends on aiter, not the reverse.
-#
+# CustomAllreduce's admission, RECORDED not imported: it is the path these backends replace, so it is
+# the envelope they must match, and aiter cannot import vllm (vllm depends on aiter, not the reverse).
 # From vllm/distributed/device_communicators/custom_all_reduce.py, `should_custom_ar`:
-#     inp_size % 16 == 0, is_weak_contiguous(inp), and inp_size < self.max_size (default 8 MiB).
-#
-# NOT from `aiter/dist/device_communicators/custom_all_reduce.py`, which is a modified fork: it
-# hardcodes `fully_connected`, splits the bound with an `8192*8192` constant, and adds a
-# `should_custom_ag` upstream does not have. Reading it as the reference produced two wrong bounds.
+#     inp_size % 16 == 0, is_weak_contiguous(inp), inp_size < self.max_size.
+# NOT aiter's vendored copy, a fork that adds an `8192*8192` bound and a `should_custom_ag` upstream
+# lacks -- reading it as the reference produced two wrong bounds.
 BASELINE_MAX_SIZE = 8 * 1024 * 1024      # CustomAllreduce's default max_size
 BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 16"
 
@@ -83,12 +77,10 @@ def _say(rank, line):
 
 
 def _expected(op_name, inputs):
-    """What every rank should hold after `op_name`. The ONE thing that genuinely differs per
-    collective and is not derivable from the API: what the right answer IS.
+    """What every rank should hold after `op_name` -- the one thing not derivable from the API.
 
-    all_reduce sums, accumulated in fp32 so the reference does not itself eat bf16 rounding.
-    all_gather concatenates rank-ordered along the last axis -- the `Communicator.all_gather`
-    contract, identical for every backend.
+    all_reduce sums in fp32 so the reference does not itself eat bf16 rounding; all_gather concatenates
+    rank-ordered along the last axis, the `Communicator.all_gather` contract for every backend.
     """
     if op_name == "all_reduce":
         acc = torch.zeros_like(inputs[0], dtype=torch.float32)
@@ -112,13 +104,9 @@ def _atol(op_name, dtype):
 # `communicator.py` -- exactly what the serving path runs, so this drives that selector directly.
 
 
-# What each backend name MUST construct. Stated independently of the factory's if-chain on purpose:
-# if the two ever disagree, one of them is wrong and this is what says so. A factory branch wired to
-# the wrong class is silent -- you ask for iris, get something else, and the run produces a
-# plausible number for the wrong thing.
-#
-# CONTROL FIRST in this dict, because the run order and the control derive from it -- one list of
-# names, not two that can drift apart.
+# What each name MUST construct, stated independently of the factory's if-chain: a branch wired to the
+# wrong class is silent -- you ask for iris, get something else, and the number looks plausible.
+# CONTROL FIRST, since the run order and the control both derive from this one list.
 _BACKEND_CLASS = {
     "torch": TorchCommunicator,     # the known-good reference
     "hip": HipCommunicator,
@@ -134,33 +122,11 @@ BACKENDS = tuple(_BACKEND_CLASS)
 # and each candidate would be a full 8-process run.
 
 DTYPES = ("fp16", "bf16")
-# [tokens, 8192] is what vLLM hands a TP=8 all-reduce: hidden size 8192, token count varying with the
-# batch. 4088 straddles nothing but is deliberately NOT a power of two, and 512 is the token count at
-# which [tokens, 8192] bf16 reaches the 8 MiB admission bound -- so 511/512 sit either side of the
-# edge where the communicator starts declining and vLLM falls back.
+# [tokens, 8192] is what vLLM hands a TP=8 all-reduce. 511/512 straddle the 8 MiB admission bound,
+# where the communicator starts declining and vLLM falls back; 4088 is deliberately not a power of two.
 SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
 
-# TWO modes, not three. `graph` ALWAYS varies the input across replays, because the
-# identical-input variant could not catch the bug this suite exists for: if replay k+1 reads k's
-# buffer before k's writes land, it gets k's data -- which EQUALS the correct answer when every
-# input is identical, so the test passes while the race is live. vLLM copies a fresh activation in
-# every token, so a stale read there is the previous token's garbage; varying is the faithful mode.
-#
-# Keeping identical-input as a third mode bought exactly one thing -- telling "capture itself is
-# broken" apart from "staleness between replays" -- and `Measurement.worst_at` already gives that:
-# diverging at replay 0 is capture, at replay 1+ is staleness. Same answer, half the matrix.
-# THE THREE MODES, as data. Each is a SCHEDULE the one runner interprets, so the difference between
-# them is this table rather than three code paths.
-#
-#   eager  does the collective compute the right answer AT ALL -- one call, no graph.
-#   graph  does capture/replay PRESERVE that -- one collective, many replays, fresh input each time.
-#   vllm   does the REAL pattern work -- a decode graph is a whole forward pass, so one capture holds
-#          one collective PER LAYER on its own buffer. The aim is that passing here means running in
-#          vLLM works; eager and graph exist to localise it when this one does not.
-#
-# `vllm` is a superset of `graph`: same replay depth, plus many buffers. It needs no separate
-# eager-then-graph field, because a captured mode already warms up with eager calls on the same
-# communicator before it captures -- which is what registers the staging buffer.
+# `vllm` is a superset of `graph`: same replay depth, plus one collective per layer in one capture.
 VLLM_LAYERS = 8
 
 # The share of one card a single case may need for its inputs and snapshots. Multi-GPU runs OWN the
@@ -181,14 +147,6 @@ class Schedule:
         return self.buffers * self.replays
 
 
-# `shapes` differs because the modes ask different questions, not to save time. `graph` is the one
-# that sweeps sizes, since capture/replay is where a size-dependent bug would live. `vllm` asks whether
-# the PATTERN works -- one collective per layer inside one capture -- and one size answers that.
-#
-# It is also the difference between a 20-minute run and an overnight one. Each rank process builds
-# EVERY rank's input for EVERY slot on the CPU (deliberately: CPU generation is bit-identical across
-# processes regardless of device). At `vllm`'s 1600 slots over four shapes that is 4 TiB of `randn`
-# across the node, which would dwarf the GPU work it exists to measure.
 SCHEDULES = {
     "eager": Schedule(buffers=1, replays=1, captured=False),
     "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True),
@@ -264,30 +222,19 @@ def gen_inputs(shape, dtype, world: int, slots: int, device):
 
 
 def _one_input(rank, k, shape, dtype):
-    """Deterministic input for (rank, replay k), generated on CPU.
-
-    CPU generation is bit-identical in every rank's process regardless of device (no reliance on
-    cross-GPU randn determinism), which is what lets each rank rebuild the FULL per-replay reference
-    locally -- including the other ranks' inputs -- without shipping tensors across the process
-    boundary. Deterministic rather than random on purpose: a failure has to be re-runnable, and an
-    exact reference makes any delta a real bug rather than fp noise.
-    """
+    """Deterministic input for (rank, k), generated on CPU so every rank's process builds a bit-identical
+    copy of everyone's input and can compute the reference locally -- no tensors cross the boundary."""
     g = torch.Generator().manual_seed(_INPUT_SEED + rank * 1_000_003 + k)
     return torch.randn(shape, generator=g).to(dtype)
 
 
 def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: int):
-    """Will this cell run? Returns `(ok, err)`: `(True, None)`, or `(False, why)`.
+    """Will this cell run? `(True, None)`, or `(False, why)`. Neither reason is a failure.
 
-    Neither reason is a failure. DECLINED means the communicator does not take this input, which is
-    correct -- vLLM falls back -- and it is asked through the API's own gate so it cannot drift. TOO BIG
-    means it would not fit: the estimate mirrors what the three steps allocate (`run_collective` keeps a
-    snapshot per slot, the only term scaling with slots; `gen_inputs` and `expected_outputs` each keep a
-    pool), with the gather fan-out taken from `_expected` so it cannot disagree with what is built.
-
-    A GUARD, not a contract -- it duplicates what those three know, so under-counting OOMs and
-    over-counting skips a cell that would have fit. Counting two of the three terms is how it once
-    passed a cell that then OOM'd.
+    A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, plus a
+    pool each for inputs and expectations -- so it duplicates their knowledge and can go stale.
+    Under-counting OOMs, over-counting skips a cell that would have fit; counting two of the three terms
+    is how it once passed a cell that then OOM'd.
     """
     one = torch.empty(shape, dtype=dtype)
     if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
@@ -302,12 +249,11 @@ def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: i
 
 
 def run_collective(comm, op_name, mine, sched: Schedule):
-    """One output per SLOT, in slot order. Slot j is replay `j // buffers` on buffer `j % buffers`.
+    """One output per SLOT: slot j is replay `j // buffers` on buffer `j % buffers`.
 
-    The graph is a LOCAL and dies when this returns; a live one makes `destroy_process_group` block
-    forever. The warmup before it runs EAGER on the same communicator, registering the staging buffer.
-    Only a snapshot copy sits between replays, so they stay back-to-back -- an elided end barrier needs
-    that to race.
+    The graph is a LOCAL and dies here; a live one makes `destroy_process_group` block forever. The
+    warmup runs EAGER on the same communicator, registering the staging buffer. Only a snapshot sits
+    between replays, so they stay back-to-back -- an elided end barrier needs that to race.
     """
     statics = [mine[m].clone() for m in range(sched.buffers)]
     # `partial` on the API itself. Nothing re-checks admission: the communicator enforces its own
@@ -357,12 +303,11 @@ def expected_outputs(op_name, inputs, slots: int):
 
 
 def compare(got, expected, atol):
-    """Every replay against its OWN reference. Pure. Returns (ok, worst_diff, worst_at, atol).
+    """Every slot against its OWN expectation -> (ok, worst_diff, worst_slot).
 
-    allclose semantics (atol + rtol*|ref|), not absolute-only: a correct large-magnitude reduce in
-    fp16 exceeds a fixed 0.01 through rounding alone, and the torch control caught exactly that.
-    `worst_at` is the diagnostic that let the identical-input mode be deleted -- diverging at replay
-    0 means capture is wrong, at replay 1+ means a stale read between replays.
+    allclose (atol + rtol*|ref|), not absolute-only: a correct large-magnitude fp16 reduce exceeds a
+    fixed 0.01 through rounding alone, which the torch control caught. Diverging at slot 0 means capture
+    is wrong, at 1+ means staleness between replays.
     """
     ok, worst_diff, worst_slot = True, 0.0, -1
     for j, (mine, ref) in enumerate(zip(got, expected)):
@@ -386,11 +331,9 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
     """
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
     worst = (True, 0.0, -1, 0.0)
-    # `with`, so the release is in the SYNTAX: `Communicator.close()` runs at block exit whatever
-    # happens inside, where `del` would only release if nothing else held a reference -- and a failing
-    # cell's traceback holds the frames that hold the communicator, so `del` fails exactly when it
-    # matters. The graph is already gone (a local of `_run`), and the caller destroys the process group
-    # after this returns, so the three lifetimes nest correctly by construction.
+    # `with`, so release is in the SYNTAX: `close()` runs at block exit whatever happens inside, where
+    # `del` only releases if nothing else holds a reference -- and a failing cell's traceback holds the
+    # frames that hold the communicator, so `del` fails exactly when it matters.
     with _build_communicator(backend, cpu_group, group, device) as comm:
         for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
             dtype = dtypes.d_dtypes[dtype_name]
@@ -435,10 +378,8 @@ def run_rank(rank, world, pp, backend, mode, init_method):
     cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)     # force comm init before we measure
     torch.cuda.synchronize()
-    # The communicator's whole life is `exercise`'s; this function owns only the PROCESS GROUP it
-    # lives in. FINALLY, because plenty can go wrong in between and a rank that dies with its group
-    # still up leaves its peers waiting on a socket instead of seeing a clean disconnect -- which
-    # turns one rank's error into everyone's 600-second timeout.
+    # FINALLY: a rank that dies with its group still up leaves its peers waiting on a socket rather
+    # than seeing a clean disconnect, turning one rank's error into everyone's 600-second timeout.
     try:
         return exercise(backend, SCHEDULES[mode], world, rank, device, cpu_group, group)
     except BaseException:
@@ -461,13 +402,9 @@ def run_rank(rank, world, pp, backend, mode, init_method):
 
 def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
                      pp: int = 1) -> Measurement:
-    """Exercise one backend in one mode across `world` ranks: spawn, collect under a timeout, take
-    the worst rank's numbers.
-
-    It RAISES. pytest is the boundary that turns a failure -- a timeout included -- into one red
-    result. A collective's bug is often visible on only a subset of ranks, so the verdict is the
-    WORST rank's and it passes only if every rank passed.
-    """
+    """Spawn `world` ranks, collect under a timeout, return the WORST rank's numbers -- a collective's
+    bug is often visible on only a subset, so it passes only if every rank passed. Raises; pytest is the
+    boundary that turns a failure, timeout included, into one red result."""
     pool = Pool(processes=world)
     init = get_distributed_init_method(addr, port)
     try:
@@ -502,13 +439,9 @@ def baseline_admits(nbytes: int) -> bool:
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_admission_matches_the_baseline(world_size: int) -> None:
-    """Every backend admits exactly what vLLM's CustomAllreduce does.
-
-    THE precondition for the matrix meaning anything: if an arm takes a tensor the baseline declines,
-    the arms route different work and the numbers compare routing, not kernels.
-
-    Needs no GPU, so it holds even where the matrix cannot run. fp32 is excluded and expected to
-    diverge -- `hip_comms.cu` has fp16 and bf16 instantiations only, so closing that needs a kernel.
+    """Every backend admits exactly what vLLM's CustomAllreduce does -- the precondition for the matrix
+    meaning anything, since arms that route different work compare routing rather than kernels. Needs no
+    GPU. fp32 is excluded: `hip_comms.cu` has fp16/bf16 instantiations only, so closing it needs a kernel.
     """
     ours = object.__new__(TorchCommunicator)
     ours.disabled, ours.world_size, ours.max_size = False, world_size, BASELINE_MAX_SIZE
@@ -535,11 +468,9 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
 def test_communicator(backend: str, mode: str, world: int, rendezvous: Tuple[str, int]) -> None:
     """Does this communicator work? One instance, its whole API, in one mode.
 
-    Not parameterised per collective or per shape: `exercise` sweeps those on ONE communicator, which
-    is what vLLM does, and it prints each cell's `worst|diff|` so a failure names the cell without
-    needing 96 pytest ids. MODE is the ladder -- if `vllm` is red and `eager`/`graph` are green, the
-    pattern is at fault rather than the arithmetic. BACKEND is outermost, so torch runs first: if the
-    control is red, nothing after it means anything.
+    Not parameterised per collective or shape -- `exercise` sweeps those on ONE communicator, as vLLM
+    does, and prints each cell so a failure names itself. BACKEND is outermost so the control runs
+    first; MODE is the ladder that localises a `vllm` failure to the pattern rather than the arithmetic.
     """
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
