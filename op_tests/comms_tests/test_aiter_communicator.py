@@ -17,12 +17,14 @@ from itertools import product
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
-from multiprocessing import Pool, set_start_method
-from typing import Tuple
+from multiprocessing import set_start_method
+from multiprocessing.pool import AsyncResult, Pool
+from typing import List, Optional, Sequence, Tuple
 
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from aiter import dtypes
 from aiter.dist.parallel_state import (
@@ -34,6 +36,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_open_port
 from aiter.ops.triton.comms.communicator import (
+    Communicator,
     HipCommunicator,
     IrisCommunicator,  # noqa: F401 -- re-enabled by uncommenting it below
     TorchCommunicator,
@@ -70,13 +73,13 @@ BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 1
 OPS = ("all_reduce", "all_gather")
 
 
-def _say(rank, line):
+def _say(rank: int, line: str) -> None:
     """Print from rank 0 only: eight ranks saying the same thing is one fact, eight times."""
     if rank == 0:
         print(line, flush=True)
 
 
-def _expected(op_name, inputs):
+def _expected(op_name: str, inputs: Sequence[torch.Tensor]) -> torch.Tensor:
     """What every rank should hold after `op_name` -- the one thing not derivable from the API.
 
     all_reduce sums in fp32 so the reference does not itself eat bf16 rounding; all_gather concatenates
@@ -90,7 +93,7 @@ def _expected(op_name, inputs):
     return torch.cat(inputs, dim=-1)
 
 
-def _atol(op_name, dtype):
+def _atol(op_name: str, dtype: torch.dtype) -> float:
     """all_gather is data movement, so effectively exact. all_reduce sums world_size values, and
     bf16's 7-bit mantissa (ULP ~8x fp16's) makes tree-vs-sequential accumulation diverge by a few
     ULPs -- benign, but a CORRECT bf16 reduce needs a dtype-aware tolerance or it reads as a failure.
@@ -167,8 +170,22 @@ class Measurement:
     worst_slot: int             # slot index of the worst divergence; -1 if exact
     atol: float
 
+    def worse_of(self, other: "Measurement") -> "Measurement":
+        """The worse of two, so a sweep folds without unpacking. Passing requires BOTH to pass."""
+        return self if self.worst_diff >= other.worst_diff and not other.within_tolerance \
+            else Measurement(
+                within_tolerance=self.within_tolerance and other.within_tolerance,
+                worst_diff=max(self.worst_diff, other.worst_diff),
+                worst_slot=other.worst_slot if other.worst_diff > self.worst_diff else self.worst_slot,
+                atol=other.atol or self.atol)
 
-def _build_communicator(backend, cpu_group, device_group, device):
+    def __str__(self) -> str:
+        at = f" @slot {self.worst_slot}" if self.worst_slot >= 0 else ""
+        return f"worst|diff|={self.worst_diff:g} atol={self.atol:g}{at}"
+
+
+def _build_communicator(backend: str, cpu_group: ProcessGroup, device_group: ProcessGroup,
+                        device: torch.device) -> Communicator:
     comm = make_communicator(cpu_group, device_group, device, backend=backend)
     # Every test funnels through here, so this one assertion covers the mapping at every
     # world size, dtype, shape and op the suite runs -- there is no separate test to
@@ -186,7 +203,7 @@ def _build_communicator(backend, cpu_group, device_group, device):
     return comm
 
 
-def _collect(pool, rets):
+def _collect(pool: Pool, rets: Sequence[AsyncResult]) -> List[Measurement]:
     """Every rank's result, or raise `mp.TimeoutError` once `CASE_TIMEOUT_S` is up.
 
     `pool.join()` cannot be used here: it waits forever, so a deadlocked rank stalls the whole run
@@ -208,7 +225,8 @@ def _collect(pool, rets):
 INPUT_POOL = 16
 
 
-def gen_inputs(shape, dtype, world: int, slots: int, device):
+def gen_inputs(shape: Tuple[int, ...], dtype: torch.dtype, world: int, slots: int,
+               device: torch.device) -> List[List[torch.Tensor]]:
     """THE one source of input: every rank's tensor for every slot, as `[rank][slot]`.
 
     A cycled POOL of `INPUT_POOL` distinct tensors, not one per slot: what a replay must detect is a
@@ -221,19 +239,19 @@ def gen_inputs(shape, dtype, world: int, slots: int, device):
     return [[made[r][j % pool] for j in range(slots)] for r in range(world)]
 
 
-def _one_input(rank, k, shape, dtype):
+def _one_input(rank: int, k: int, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     """Deterministic input for (rank, k), generated on CPU so every rank's process builds a bit-identical
     copy of everyone's input and can compute the reference locally -- no tensors cross the boundary."""
     g = torch.Generator().manual_seed(_INPUT_SEED + rank * 1_000_003 + k)
     return torch.randn(shape, generator=g).to(dtype)
 
 
-def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: int):
+def precheck(comm: Communicator, op_name: str, shape: Tuple[int, ...], dtype: torch.dtype,
+             world: int, sched: Schedule, budget: int) -> Optional[str]:
     """Why this cell will not run, or None if it will. Neither reason is a failure.
 
-    ONLY the error, no value: there is nothing to return besides the reason, and a `(bool, err)` pair
-    would carry the same fact twice -- `err is None` already IS the bool. Go's shape for the same case
-    (`func (f *File) Close() error`).
+    Void + error, since there is nothing to return but the reason -- Go's `func (f *File) Close() error`.
+    The pair is for a function with a VALUE; the check is always on `err`, never on a bool.
 
     A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, plus a
     pool each for inputs and expectations -- so it duplicates their knowledge and can go stale.
@@ -252,7 +270,8 @@ def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: i
     return None
 
 
-def run_collective(comm, op_name, mine, sched: Schedule):
+def run_collective(comm: Communicator, op_name: str, mine: Sequence[torch.Tensor],
+                   sched: Schedule) -> List[torch.Tensor]:
     """One output per SLOT: slot j is replay `j // buffers` on buffer `j % buffers`.
 
     The graph is a LOCAL and dies here; a live one makes `destroy_process_group` block forever. The
@@ -264,10 +283,10 @@ def run_collective(comm, op_name, mine, sched: Schedule):
     # envelope and raises, so a check here would restate what the callee guarantees.
     ops = [partial(getattr(comm, op_name), st) for st in statics]
 
-    def body():
+    def body() -> List[torch.Tensor]:
         return [op() for op in ops]
 
-    def feed(replay):
+    def feed(replay: int) -> None:
         for m, st in enumerate(statics):
             st.copy_(mine[replay * sched.buffers + m])
 
@@ -294,7 +313,8 @@ def run_collective(comm, op_name, mine, sched: Schedule):
     return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs))]
 
 
-def expected_outputs(op_name, inputs, slots: int):
+def expected_outputs(op_name: str, inputs: Sequence[Sequence[torch.Tensor]],
+                     slots: int) -> List[torch.Tensor]:
     """What this rank should hold after each slot: the collective applied to every rank's input.
 
     POOLED like the inputs, and for the same reason -- only `INPUT_POOL` inputs are distinct, so only
@@ -306,8 +326,9 @@ def expected_outputs(op_name, inputs, slots: int):
     return [made[j % pool] for j in range(slots)]
 
 
-def compare(got, expected, atol):
-    """Every slot against its OWN expectation -> (ok, worst_diff, worst_slot).
+def compare(got: Sequence[torch.Tensor], expected: Sequence[torch.Tensor],
+            atol: float) -> Measurement:
+    """Every slot against its OWN expectation.
 
     allclose (atol + rtol*|ref|), not absolute-only: a correct large-magnitude fp16 reduce exceeds a
     fixed 0.01 through rounding alone, which the torch control caught. Diverging at slot 0 means capture
@@ -321,11 +342,11 @@ def compare(got, expected, atol):
             worst_diff, worst_slot = d, j
         if not torch.allclose(a, b, atol=atol, rtol=0.01):
             ok = False
-    return ok, worst_diff, worst_slot
+    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_slot=worst_slot, atol=atol)
 
 
-def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
-             cpu_group, group) -> tuple:
+def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch.device,
+             cpu_group: ProcessGroup, group: ProcessGroup) -> Measurement:
     """CREATE a communicator, exercise its whole API, TEAR IT DOWN. Returns the worst verdict.
 
     It owns the lifetime because construction and teardown are two of the ways a communicator fails --
@@ -334,7 +355,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
     correct behaviour. Each cell is scoped so its tensors die with the frame.
     """
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
-    worst = (True, 0.0, -1, 0.0)
+    worst = Measurement(within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0)
     # `with`, so release is in the SYNTAX: `close()` runs at block exit whatever happens inside, where
     # `del` only releases if nothing else holds a reference -- and a failing cell's traceback holds the
     # frames that hold the communicator, so `del` fails exactly when it matters.
@@ -344,7 +365,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
             where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
             atol = _atol(op_name, dtype)
 
-            def cell():
+            def cell() -> Tuple[Optional[Measurement], Optional[str]]:
                 if err := precheck(comm, op_name, shape, dtype, world, sched, budget):
                     return None, err
                 inputs = gen_inputs(shape, dtype, world, sched.slots, device)
@@ -352,22 +373,20 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
                 expected = expected_outputs(op_name, inputs, sched.slots)
                 return compare(got, expected, atol), None
 
-            verdict, err = cell()
+            got, err = cell()
             if err:
                 _say(rank, f"      - {where} {err}")
                 continue
-            ok, diff, at = verdict
-            _say(rank, f"      {where} worst|diff|={diff:g} atol={atol:g}"
-                       + (f" @slot {at}" if at >= 0 else ""))
-            worst = (worst[0] and ok, max(worst[1], diff),
-                     at if diff > worst[1] else worst[2], atol)
+            _say(rank, f"      {where} {got}")
+            worst = worst.worse_of(got)
             torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     return worst
 
 
-def run_rank(rank, world, pp, backend, mode, init_method):
+def run_rank(rank: int, world: int, pp: int, backend: str, mode: str,
+             init_method: str) -> Measurement:
     """ONE per-rank worker. It owns the PROCESS GROUP; the communicator's life is `exercise`'s.
 
     Every rank rebuilds every rank's input from a seed, so it judges its own replays and only scalars
@@ -418,10 +437,10 @@ def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
     finally:
         pool.terminate()               # frees the GPUs whether it passed, failed or hung
 
-    ok = all(r[0] for r in per_rank)
-    _, worst_diff, worst_slot, atol = max(per_rank, key=lambda r: r[1])
-    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_slot=worst_slot,
-                       atol=atol)
+    worst = per_rank[0]
+    for m in per_rank[1:]:
+        worst = worst.worse_of(m)
+    return worst
 
 
 @pytest.fixture(scope="session")
