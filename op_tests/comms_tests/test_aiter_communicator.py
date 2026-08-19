@@ -276,31 +276,29 @@ def _one_input(rank, k, shape, dtype):
     return torch.randn(shape, generator=g).to(dtype)
 
 
-def skip_reason(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: int):
-    """Why this cell will not be exercised, or None. The two reasons, and they are not failures.
+def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: int):
+    """Will this cell run? Returns `(ok, err)`: `(True, None)`, or `(False, why)`.
 
-    DECLINED: the communicator says it does not take this input, which is correct behaviour -- vLLM
-    falls back. Asked through the API's own gate, so this cannot drift from what it would answer.
+    Neither reason is a failure. DECLINED means the communicator does not take this input, which is
+    correct -- vLLM falls back -- and it is asked through the API's own gate so it cannot drift. TOO BIG
+    means it would not fit: the estimate mirrors what the three steps allocate (`run_collective` keeps a
+    snapshot per slot, the only term scaling with slots; `gen_inputs` and `expected_outputs` each keep a
+    pool), with the gather fan-out taken from `_expected` so it cannot disagree with what is built.
 
-    TOO BIG: it would not fit. The estimate mirrors what the three steps allocate -- `run_collective`
-    keeps one snapshot per slot (the only term scaling with slots), `gen_inputs` and
-    `expected_outputs` each keep a pool -- and a gather's output is world_size x its input, taken from
-    `_expected` so the fan-out cannot disagree with what is actually built.
-
-    It is a GUARD, not a contract: it duplicates what those three know, so under-counting OOMs and
-    over-counting skips a cell that would have fit. Both are visible, and counting only two of the
-    three terms is exactly how it once passed a cell that then OOM'd.
+    A GUARD, not a contract -- it duplicates what those three know, so under-counting OOMs and
+    over-counting skips a cell that would have fit. Counting two of the three terms is how it once
+    passed a cell that then OOM'd.
     """
     one = torch.empty(shape, dtype=dtype)
     if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
-        return "declined by the communicator"
+        return False, "declined by the communicator"
     per = one.numel() * one.element_size()
     fan = _expected(op_name, [one] * world).numel() // one.numel()
     pool = min(sched.slots, INPUT_POOL)
     need = sched.slots * per * fan + pool * per * world + pool * per * fan
     if need > budget:
-        return f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
-    return None
+        return False, f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
+    return True, None
 
 
 def run_collective(comm, op_name, mine, sched: Schedule):
@@ -397,18 +395,22 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
         for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
             dtype = dtypes.d_dtypes[dtype_name]
             where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
-            if why := skip_reason(comm, op_name, shape, dtype, world, sched, budget):
-                _say(rank, f"      - {where} {why}")
-                continue
             atol = _atol(op_name, dtype)
 
             def cell():
+                ok, err = precheck(comm, op_name, shape, dtype, world, sched, budget)
+                if not ok:
+                    return None, err
                 inputs = gen_inputs(shape, dtype, world, sched.slots, device)
                 got = run_collective(comm, op_name, inputs[rank], sched)
                 expected = expected_outputs(op_name, inputs, sched.slots)
-                return compare(got, expected, atol)
+                return compare(got, expected, atol), None
 
-            ok, diff, at = cell()
+            verdict, err = cell()
+            if err:
+                _say(rank, f"      - {where} {err}")
+                continue
+            ok, diff, at = verdict
             _say(rank, f"      {where} worst|diff|={diff:g} atol={atol:g}"
                        + (f" @replay {at}" if at >= 0 else ""))
             worst = (worst[0] and ok, max(worst[1], diff),
