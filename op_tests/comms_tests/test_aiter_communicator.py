@@ -1,23 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness of EVERY communicator backend's collective ops (all_reduce and
-all_gather) in two modes: `eager` (one call) and `graph` (captured once, then replayed with a
-FRESH input every replay).
+"""Does each communicator backend work?
 
-One question per backend: does it produce correct results? Eager
-alone is not enough — the gluon kernels elide barriers under graph capture, and a
-race there only shows across a sequence of replays (vLLM captures the decode step
-once and replays it every token).
+One test per (backend, mode). `exercise` puts ONE communicator through the whole API -- both
+collectives, both dtypes, every shape -- because that is what vLLM does. Every cell is four steps:
+gen_inputs -> run_collective -> expected_outputs -> compare.
 
-But replaying the SAME input every time is also not enough: a stale-heap read
-(replay k+1 reading replay k's symmetric-buffer before k's writes land) returns
-the previous replay's data, and when every replay's input is identical the stale
-data EQUALS the correct data, so the bug hides. vLLM never does that — it copies
-a fresh activation into the static input buffer before each token's replay, so a
-stale read there is the *previous token's* data = garbage. The varying-input
-check (run_comm_vary) reproduces exactly that: fresh input per replay, each
-replay's output checked against its own reference. That is the mode that catches
-the dropped/stale all_gather race the identical-input loop misses.
+The modes localise a failure rather than covering different ground: `eager` asks whether the
+collective is right at all, `graph` whether capture/replay preserves that across many replays with
+fresh input, `vllm` whether the real pattern works (one collective per layer in one capture).
 """
 
 import logging
@@ -85,10 +76,6 @@ BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 1
 OPS = ("all_reduce", "all_gather")
 
 
-
-
-
-
 def _say(rank, line):
     """Print from rank 0 only: eight ranks saying the same thing is one fact, eight times."""
     if rank == 0:
@@ -121,14 +108,8 @@ def _atol(op_name, dtype):
     return 0.1 if dtype == torch.bfloat16 else 0.01
 
 
-# ── Communicator: one interface, three impls, one branching point ──
-# The interface (Communicator ABC), all three impls -- IrisCommunicator, HipCommunicator
-# (ours) and TorchCommunicator (the known-good control) -- and the make_communicator
-# selector all live in aiter's communicator.py, which is exactly what the serving
-# path runs. This test drives that selector directly: every backend runs the same
-# matrix, and "torch" is the control because it is the known-good one.
-# make_communicator returns the communicator without raising on unavailability, so
-# _build_communicator checks `.disabled` here.
+# The interface, all three impls and the `make_communicator` selector live in aiter's
+# `communicator.py` -- exactly what the serving path runs, so this drives that selector directly.
 
 
 # What each backend name MUST construct. Stated independently of the factory's if-chain on purpose:
@@ -149,13 +130,8 @@ _BACKEND_CLASS = {
 BACKENDS = tuple(_BACKEND_CLASS)
 
 
-# ── THE DOMAIN: one type, one generator ──
-# What this suite explores is a TYPE, not four module-level lists read in a five-deep nest. A
-# reader answers "what does this cover" from `Case` and `cases()` alone, and one failing case is
-# nameable, so re-running exactly it is possible.
-#
-# Enumerated rather than property-generated: a shrinking framework cannot drive across spawned
-# ranks, and each candidate would be a full 8-process run.
+# Enumerated rather than property-generated: a shrinking framework cannot drive across spawned ranks,
+# and each candidate would be a full 8-process run.
 
 DTYPES = ("fp16", "bf16")
 # [tokens, 8192] is what vLLM hands a TP=8 all-reduce: hidden size 8192, token count varying with the
@@ -198,7 +174,6 @@ class Schedule:
     buffers: int        # distinct input buffers the collective is called on, per replay
     replays: int        # how many times the body runs
     captured: bool      # is the body recorded into a cudagraph and replayed
-    shapes: tuple       # which shapes this mode sweeps -- see SCHEDULES
 
     @property
     def slots(self) -> int:
@@ -215,15 +190,11 @@ class Schedule:
 # processes regardless of device). At `vllm`'s 1600 slots over four shapes that is 4 TiB of `randn`
 # across the node, which would dwarf the GPU work it exists to measure.
 SCHEDULES = {
-    "eager": Schedule(buffers=1, replays=1, captured=False, shapes=SHAPES),
-    "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True, shapes=SHAPES),
-    "vllm": Schedule(buffers=VLLM_LAYERS, replays=GRAPH_REPLAYS, captured=True, shapes=SHAPES[:1]),
+    "eager": Schedule(buffers=1, replays=1, captured=False),
+    "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True),
+    "vllm": Schedule(buffers=VLLM_LAYERS, replays=GRAPH_REPLAYS, captured=True),
 }
 MODES = tuple(SCHEDULES)
-
-
-
-
 
 
 @dataclass(frozen=True)
@@ -237,12 +208,6 @@ class Measurement:
     worst_diff: float
     worst_at: int               # replay index of the worst divergence; -1 for eager
     atol: float
-
-
-
-
-
-
 
 
 def _build_communicator(backend, cpu_group, device_group, device):
@@ -261,7 +226,6 @@ def _build_communicator(backend, cpu_group, device_group, device):
     if comm.disabled:
         raise RuntimeError(f"{backend} communicator disabled")
     return comm
-
 
 
 def _collect(pool, rets):
@@ -283,7 +247,23 @@ def _collect(pool, rets):
     return out
 
 
-def _replay_input(rank, k, shape, dtype):
+INPUT_POOL = 16
+
+
+def gen_inputs(shape, dtype, world: int, slots: int, device):
+    """THE one source of input: every rank's tensor for every slot, as `[rank][slot]`.
+
+    A cycled POOL of `INPUT_POOL` distinct tensors, not one per slot: what a replay must detect is a
+    read of the PREVIOUS slot's data, so consecutive slots differing is what matters, not all 1600
+    being unique. Per-slot interface, per-pool memory -- 1 GiB rather than 100 at `vllm`'s 1600 slots,
+    which is what lets every shape run in every mode.
+    """
+    pool = min(slots, INPUT_POOL)
+    made = [[_one_input(r, j, shape, dtype).to(device) for j in range(pool)] for r in range(world)]
+    return [[made[r][j % pool] for j in range(slots)] for r in range(world)]
+
+
+def _one_input(rank, k, shape, dtype):
     """Deterministic input for (rank, replay k), generated on CPU.
 
     CPU generation is bit-identical in every rank's process regardless of device (no reliance on
@@ -296,25 +276,25 @@ def _replay_input(rank, k, shape, dtype):
     return torch.randn(shape, generator=g).to(dtype)
 
 
-def _run(comm, ops, statics, inputs, sched: Schedule):
-    """Run `sched` and return one output per SLOT, in slot order. THE only runner.
+def run_collective(comm, op_name, mine, sched: Schedule):
+    """One output per SLOT, in slot order. Slot j is replay `j // buffers` on buffer `j % buffers`.
 
-    Slot j is replay `j // buffers` on buffer `j % buffers`, which is the index the inputs are built
-    on and the one `_judge` reads -- so a mode with many buffers needs no separate judging.
-
-    When captured, the graph is a LOCAL: it must die before the process group is destroyed, or
-    `destroy_process_group` blocks forever draining work a live graph still owns. The warmup calls
-    before it are EAGER on the same communicator, which is what registers the staging buffer.
-
-    Only a snapshot copy sits between replays, so they stay back-to-back -- an elided end barrier
-    needs that to race. Everything is checked after one sync.
+    The graph is a LOCAL and dies when this returns; a live one makes `destroy_process_group` block
+    forever. The warmup before it runs EAGER on the same communicator, registering the staging buffer.
+    Only a snapshot copy sits between replays, so they stay back-to-back -- an elided end barrier needs
+    that to race.
     """
+    statics = [mine[m].clone() for m in range(sched.buffers)]
+    # `partial` on the API itself. Nothing re-checks admission: the communicator enforces its own
+    # envelope and raises, so a check here would restate what the callee guarantees.
+    ops = [partial(getattr(comm, op_name), st) for st in statics]
+
     def body():
         return [op() for op in ops]
 
     def feed(replay):
         for m, st in enumerate(statics):
-            st.copy_(inputs[replay * len(statics) + m])
+            st.copy_(mine[replay * sched.buffers + m])
 
     if not sched.captured:
         out = []
@@ -339,7 +319,12 @@ def _run(comm, ops, statics, inputs, sched: Schedule):
     return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs))]
 
 
-def _judge(op_name, dtype, all_inputs, got):
+def expected_outputs(op_name, inputs, slots: int):
+    """What this rank should hold after each slot: the collective applied to every rank's input."""
+    return [_expected(op_name, [inputs[r][j] for r in range(len(inputs))]) for j in range(slots)]
+
+
+def compare(got, expected, atol):
     """Every replay against its OWN reference. Pure. Returns (ok, worst_diff, worst_at, atol).
 
     allclose semantics (atol + rtol*|ref|), not absolute-only: a correct large-magnitude reduce in
@@ -347,38 +332,25 @@ def _judge(op_name, dtype, all_inputs, got):
     `worst_at` is the diagnostic that let the identical-input mode be deleted -- diverging at replay
     0 means capture is wrong, at replay 1+ means a stale read between replays.
     """
-    atol, rtol = _atol(op_name, dtype), 0.01
-    ok, worst_diff, worst_at = True, 0.0, -1
-    for k, mine in enumerate(got):
-        ref = _expected(op_name, [all_inputs[r][k] for r in range(len(all_inputs))]).to(torch.float32)
-        cur = mine.to(torch.float32)
-        d = (cur - ref).abs().max().item()
+    ok, worst_diff, worst_slot = True, 0.0, -1
+    for j, (mine, ref) in enumerate(zip(got, expected)):
+        a, b = mine.to(torch.float32), ref.to(torch.float32)
+        d = (a - b).abs().max().item()
         if d > worst_diff:
-            worst_diff, worst_at = d, k
-        if not torch.allclose(cur, ref, atol=atol, rtol=rtol):
+            worst_diff, worst_slot = d, j
+        if not torch.allclose(a, b, atol=atol, rtol=0.01):
             ok = False
-    return ok, worst_diff, worst_at, atol
+    return ok, worst_diff, worst_slot
 
 
 def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
              cpu_group, group) -> tuple:
-    """CREATE a communicator, put it through its whole API, TEAR IT DOWN. Returns the worst verdict.
-    THE definition of "does this communicator work".
+    """CREATE a communicator, exercise its whole API, TEAR IT DOWN. Returns the worst verdict.
 
-    It owns the whole lifetime because construction and teardown are two of the ways a communicator
-    fails, not setup around the part that counts: building one is a COLLECTIVE (hip exchanges IPC
-    handles, so a non-uniform failure hangs rather than errors), and teardown releases those handles.
-    Owning both puts the ORDER beyond reach -- the communicator is closed before the caller destroys
-    the group, by nesting rather than by comment.
-
-    ONE instance does every cell, which is both the question worth asking and what vLLM does: it drives
-    all_reduce and all_gather through a single communicator for the life of the server, so exercising
-    them on separate instances tests something easier than production.
-
-    A cell the communicator DECLINES, or one past the memory budget, is reported and skipped rather
-    than failed: declining is correct behaviour, and the footprint is arithmetic. Each cell runs in a
-    nested scope so its tensors die with the frame -- at `vllm`'s 1600 slots one cell can hold most of
-    a card, and the next needs that memory back.
+    It owns the lifetime because construction and teardown are two of the ways a communicator fails --
+    building one is a collective, and teardown releases IPC handles -- and owning both puts the order
+    beyond reach. A declined cell, or one past the memory budget, is reported and skipped: declining is
+    correct behaviour. Each cell is scoped so its tensors die with the frame.
     """
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
     worst = (True, 0.0, -1, 0.0)
@@ -388,7 +360,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
     # matters. The graph is already gone (a local of `_run`), and the caller destroys the process group
     # after this returns, so the three lifetimes nest correctly by construction.
     with _build_communicator(backend, cpu_group, group, device) as comm:
-        for op_name, dtype_name, shape in product(OPS, DTYPES, sched.shapes):
+        for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
             dtype = dtypes.d_dtypes[dtype_name]
             one = torch.empty(shape, dtype=dtype)
             where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
@@ -406,17 +378,15 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
                            f"budget {budget / 2**30:.0f}G")
                 continue
 
-            def cell():
-                all_inputs = [[_replay_input(r, j, shape, dtype).to(device)
-                               for j in range(sched.slots)] for r in range(world)]
-                mine = all_inputs[rank]
-                statics = [mine[m].clone() for m in range(sched.buffers)]
-                # `partial` on the API itself. No wrapper re-checks admission: the communicator
-                # enforces its own envelope and raises, so a check here would restate that.
-                ops = [partial(getattr(comm, op_name), st) for st in statics]
-                return _judge(op_name, dtype, all_inputs, _run(comm, ops, statics, mine, sched))
+            atol = _atol(op_name, dtype)
 
-            ok, diff, at, atol = cell()
+            def cell():
+                inputs = gen_inputs(shape, dtype, world, sched.slots, device)
+                got = run_collective(comm, op_name, inputs[rank], sched)
+                expected = expected_outputs(op_name, inputs, sched.slots)
+                return compare(got, expected, atol)
+
+            ok, diff, at = cell()
             _say(rank, f"      {where} worst|diff|={diff:g} atol={atol:g}"
                        + (f" @replay {at}" if at >= 0 else ""))
             worst = (worst[0] and ok, max(worst[1], diff),
