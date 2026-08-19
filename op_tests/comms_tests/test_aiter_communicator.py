@@ -180,7 +180,13 @@ MODES = tuple(SCHEDULES)
 
 @dataclass(frozen=True)
 class Measurement:
-    """What a case that RAN produced. Pure numbers; no error channel."""
+    """What a case that RAN produced: pure numbers.
+
+    No error field -- not because errors do not matter, but because this is where they do NOT live. A
+    function that can fail returns `(value, err)`, so the error track is the tuple's second slot and
+    this type is the value slot. A `failed` field here would give an error two homes, and the one
+    nobody checks is the one that hides a red run.
+    """
 
     # The ranks' own allclose verdict, STORED rather than re-derived. Deriving it as
     # `worst_diff <= atol` would be absolute-only, and a correct large-magnitude fp16 reduce exceeds
@@ -236,23 +242,34 @@ def _build_communicator(backend: str, cpu_group: ProcessGroup, device_group: Pro
     return comm
 
 
-def _collect(pool: Pool, rets: Sequence[AsyncResult]) -> List[Measurement]:
-    """Every rank's result, or raise `mp.TimeoutError` once `CASE_TIMEOUT_S` is up.
+def _collect(pool: Pool, rets: Sequence[AsyncResult]) -> Tuple[
+        Optional[List[Tuple[Optional["Measurement"], Optional[str]]]], Optional[str]]:
+    """Every rank's OUTCOME, or why we could not get them all.
 
-    `pool.join()` cannot be used here: it waits forever, so a deadlocked rank stalls the whole run
-    with nothing printed. `terminate()` frees the GPUs for the next case.
+    Each element is that rank's own `(value, err)`; this pair is about the collecting. `pool.join()`
+    cannot be used here: it waits forever, so a deadlocked rank stalls the whole run with nothing
+    printed. `terminate()` frees the GPUs for the next case.
+
+    A rank that raised has already logged its traceback in its own process, so an error here only has
+    to name the rank -- and returning it as a value is what lets the caller report EVERY rank rather
+    than the one exception the pool happened to surface first.
     """
     deadline = time.monotonic() + CASE_TIMEOUT_S
-    out = []
-    try:
-        for r in rets:
-            out.append(r.get(timeout=max(1.0, deadline - time.monotonic())))
-    except mp.TimeoutError:
-        pool.terminate()
-        pool.join()
-        raise
+    out: List[Tuple[Optional["Measurement"], Optional[str]]] = []
+    for r, ret in enumerate(rets):
+        try:
+            out.append(ret.get(timeout=max(1.0, deadline - time.monotonic())))
+        except mp.TimeoutError:
+            pool.terminate()
+            pool.join()
+            return None, (f"rank {r} still running after {CASE_TIMEOUT_S}s -- a deadlock; "
+                          f"{len(out)} of {len(rets)} ranks returned")
+        except Exception as e:
+            pool.terminate()
+            pool.join()
+            return None, f"rank {r} did not come back: {type(e).__name__}: {e}"
     pool.join()
-    return out
+    return out, None
 
 
 INPUT_POOL = 16
@@ -403,8 +420,16 @@ def compare(got: Sequence[torch.Tensor], expected: Sequence[torch.Tensor],
 
 
 def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch.device,
-             cpu_group: ProcessGroup, group: ProcessGroup) -> Measurement:
-    """CREATE a communicator, exercise its whole API, TEAR IT DOWN. Returns the worst verdict.
+             cpu_group: ProcessGroup, group: ProcessGroup) -> Tuple[Optional[Measurement],
+                                                                    Optional[str]]:
+    """CREATE a communicator, exercise its whole API, TEAR IT DOWN. `(worst verdict, None)`, or
+    `(None, why nothing was measured)`.
+
+    TWO LEVELS of error track, carrying different things. A CELL's `err` means that cell did not run
+    -- declined, or over budget -- which is not a failure and does not stop the sweep. This function's
+    `err` means the sweep produced NO measurement at all. A cell that RAISES is neither: it is a real
+    failure and it propagates, to be logged with its traceback and turned into an error track by
+    `run_rank`.
 
     It owns the lifetime because construction and teardown are two of the ways a communicator fails --
     building one is a collective, and teardown releases IPC handles -- and owning both puts the order
@@ -413,6 +438,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
     """
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
     worst = Measurement(within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0, rtol=0.0)
+    ran = 0
     # `with`, so release is in the SYNTAX: `close()` runs at block exit whatever happens inside, where
     # `del` only releases if nothing else holds a reference -- and a failing cell's traceback holds the
     # frames that hold the communicator, so `del` fails exactly when it matters.
@@ -442,18 +468,24 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
                 continue
             _say(rank, f"      {where} {got}")
             worst = worst.worse_of(got)
+            ran += 1
             torch.cuda.empty_cache()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
-    return worst
+    # COUNTED, because the seed verdict passes: a communicator that declined everything would
+    # otherwise fold to `ok worst|diff|=0` and report green having measured nothing.
+    if ran == 0:
+        return None, "no cell ran -- every one was declined or over budget, so nothing was measured"
+    return worst, None
 
 
 def run_rank(rank: int, world: int, pp: int, backend: str, mode: str,
-             init_method: str) -> Measurement:
+             init_method: str) -> Tuple[Optional[Measurement], Optional[str]]:
     """ONE per-rank worker. It owns the PROCESS GROUP; the communicator's life is `exercise`'s.
 
     Every rank rebuilds every rank's input from a seed, so it judges its own replays and only scalars
-    cross the process boundary.
+    cross the process boundary. `err` is set when this rank failed, and it is a VALUE rather than an
+    exception so the parent gets EVERY rank's verdict.
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -467,11 +499,13 @@ def run_rank(rank: int, world: int, pp: int, backend: str, mode: str,
     # than seeing a clean disconnect, turning one rank's error into everyone's 600-second timeout.
     try:
         return exercise(backend, SCHEDULES[mode], world, rank, device, cpu_group, group)
-    except BaseException:
-        # Logged HERE, with the rank, before it crosses the process boundary: the pool surfaces one
-        # failure to the parent, and on eight ranks the one it picks is not always the informative one.
+    except Exception as e:
+        # Logged HERE, with the rank and the full traceback, before anything crosses the process
+        # boundary -- then RETURNED, not re-raised. Re-raising surfaces one rank to the parent and on
+        # eight ranks the one the pool picks is not always the informative one. `Exception`, not
+        # `BaseException`: a Ctrl-C is not this rank's verdict and has to keep unwinding.
         logger.exception("rank %d failed exercising %s/%s", rank, backend, mode)
-        raise
+        return None, f"{type(e).__name__}: {e}"
     finally:
         # Its OWN try, so a teardown that fails cannot replace the failure that got us here -- the
         # diagnosis is worth more than the cleanup, and `destroy_process_group` is exactly the call
@@ -486,24 +520,31 @@ def run_rank(rank: int, world: int, pp: int, backend: str, mode: str,
 
 
 def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
-                     pp: int = 1) -> Measurement:
-    """Spawn `world` ranks, collect under a timeout, return the WORST rank's numbers -- a collective's
-    bug is often visible on only a subset, so it passes only if every rank passed. Raises; pytest is the
-    boundary that turns a failure, timeout included, into one red result."""
+                     pp: int = 1) -> Tuple[Optional[Measurement], Optional[str]]:
+    """Spawn `world` ranks, collect under a timeout, fold to the WORST rank's numbers -- a collective's
+    bug is often visible on only a subset, so it passes only if EVERY rank passed."""
     pool = Pool(processes=world)
     init = get_distributed_init_method(addr, port)
     try:
         rets = [pool.apply_async(run_rank, args=(r, world, pp, backend, mode, init))
                 for r in range(world)]
         pool.close()
-        per_rank = _collect(pool, rets)
+        per_rank, err = _collect(pool, rets)
     finally:
         pool.terminate()               # frees the GPUs whether it passed, failed or hung
+    if err is not None:
+        return None, err
 
-    worst = per_rank[0]
-    for m in per_rank[1:]:
+    # EVERY failing rank, not the first: they usually fail for one reason, and the ranks that did NOT
+    # fail are half of what a count like `[1,1,1,0,0,1,1,1]` tells you.
+    failed = [f"rank {r}: {e}" for r, (_, e) in enumerate(per_rank) if e is not None]
+    if failed:
+        return None, "; ".join(failed)
+
+    worst = per_rank[0][0]
+    for m, _ in per_rank[1:]:
         worst = worst.worse_of(m)
-    return worst
+    return worst, None
 
 
 @pytest.fixture(scope="session")
@@ -562,6 +603,10 @@ def test_communicator(backend: str, mode: str, world: int, rendezvous: Tuple[str
         pytest.skip("a collective needs at least two ranks")
     addr, port = rendezvous
     print(f"\n  {backend} / {mode}", flush=True)
-    got = run_communicator(backend, mode, world, addr, port)
+    got, err = run_communicator(backend, mode, world, addr, port)
+    # THE ERROR TRACK, checked explicitly against None: set means the case produced no measurement at
+    # all, and `got` is not to be read. Only then is there a verdict to assert on.
+    if err is not None:
+        pytest.fail(f"{backend}/{mode}: {err}")
     print(f"      => {got}", flush=True)
     assert got.within_tolerance, f"{backend}/{mode}: outside tolerance (cells above)"
