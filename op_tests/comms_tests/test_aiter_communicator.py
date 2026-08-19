@@ -78,7 +78,12 @@ OPS = ("all_reduce", "all_gather")
 
 
 def _say(rank: int, line: str) -> None:
-    """Print from rank 0 only: eight ranks saying the same thing is one fact, eight times."""
+    """Print from rank 0 only: eight ranks saying the same thing is one fact, eight times.
+
+    Rank 0 is not a NEUTRAL sample, though. `one_shot_all_reduce` rotates its peer read order by
+    rank, so rank 0 sums 0..world-1 -- the reference's own order -- and is the one rank that can be
+    bit-exact. `run_communicator` prints the spread across ranks for exactly this reason.
+    """
     if rank == 0:
         print(line, flush=True)
 
@@ -604,8 +609,17 @@ def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
     if failed:
         return None, "; ".join(failed)
 
-    worst = per_rank[0][0]
-    for m, _ in per_rank[1:]:
+    ms = [m for m, _ in per_rank]
+    # The SPREAD, whenever the ranks disagree. The cell lines above come from rank 0 only, and for
+    # `hip` that is the rank whose summation order matches the reference -- so its `worst|diff|=0`
+    # says nothing about the other seven. A rank-rotated read order (see `one_shot_all_reduce`) puts
+    # them within an ULP rather than bitwise, and printing it is what stops the next reader chasing
+    # the gap between a cell line and this fold as if it were a bug.
+    if len({m.worst_diff for m in ms}) > 1:
+        print("      per-rank worst|diff|: "
+              + "  ".join(f"{r}:{m.worst_diff:g}" for r, m in enumerate(ms)), flush=True)
+    worst = ms[0]
+    for m in ms[1:]:
         worst = worst.worse_of(m)
     return worst, None
 

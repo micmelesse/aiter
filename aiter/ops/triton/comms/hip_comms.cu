@@ -150,6 +150,11 @@ __global__ void __launch_bounds__(512, 1)
     one_shot_all_reduce(const PeerPtrs* peers, PeerSignals sigs, Signal* self,
                         T* __restrict__ out, int rank, int size) {
   using V = typename traits<T>::V;
+  // ROTATED by rank, so the ranks do not all hammer rank 0's buffer first. The consequence is
+  // worth knowing: every rank sums the same ngpus values in a DIFFERENT order, so the outputs
+  // agree only to within one ULP of T rather than bitwise. `reduce_at` accumulates in float and
+  // rounds once, which bounds it there. Rank 0's order is 0..ngpus-1, so rank 0 alone matches a
+  // sequential reference exactly -- a test that reads only rank 0 will call this bit-exact.
   const V* ptrs[ngpus];
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
