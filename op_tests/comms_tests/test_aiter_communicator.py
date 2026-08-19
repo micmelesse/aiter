@@ -157,6 +157,13 @@ BACKENDS = tuple(_BACKEND_CLASS)
 # Enumerated rather than property-generated: a shrinking framework cannot drive across spawned
 # ranks, and each candidate would be a full 8-process run.
 
+DTYPES = ("fp16", "bf16")
+# [tokens, 8192] is what vLLM hands a TP=8 all-reduce: hidden size 8192, token count varying with the
+# batch. 4088 straddles nothing but is deliberately NOT a power of two, and 512 is the token count at
+# which [tokens, 8192] bf16 reaches the 8 MiB admission bound -- so 511/512 sit either side of the
+# edge where the communicator starts declining and vLLM falls back.
+SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
+
 # TWO modes, not three. `graph` ALWAYS varies the input across replays, because the
 # identical-input variant could not catch the bug this suite exists for: if replay k+1 reads k's
 # buffer before k's writes land, it gets k's data -- which EQUALS the correct answer when every
@@ -191,6 +198,7 @@ class Schedule:
     buffers: int        # distinct input buffers the collective is called on, per replay
     replays: int        # how many times the body runs
     captured: bool      # is the body recorded into a cudagraph and replayed
+    shapes: tuple       # which shapes this mode sweeps -- see SCHEDULES
 
     @property
     def slots(self) -> int:
@@ -198,20 +206,22 @@ class Schedule:
         return self.buffers * self.replays
 
 
+# `shapes` differs because the modes ask different questions, not to save time. `graph` is the one
+# that sweeps sizes, since capture/replay is where a size-dependent bug would live. `vllm` asks whether
+# the PATTERN works -- one collective per layer inside one capture -- and one size answers that.
+#
+# It is also the difference between a 20-minute run and an overnight one. Each rank process builds
+# EVERY rank's input for EVERY slot on the CPU (deliberately: CPU generation is bit-identical across
+# processes regardless of device). At `vllm`'s 1600 slots over four shapes that is 4 TiB of `randn`
+# across the node, which would dwarf the GPU work it exists to measure.
 SCHEDULES = {
-    "eager": Schedule(buffers=1, replays=1, captured=False),
-    "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True),
-    "vllm": Schedule(buffers=VLLM_LAYERS, replays=GRAPH_REPLAYS, captured=True),
+    "eager": Schedule(buffers=1, replays=1, captured=False, shapes=SHAPES),
+    "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True, shapes=SHAPES),
+    "vllm": Schedule(buffers=VLLM_LAYERS, replays=GRAPH_REPLAYS, captured=True, shapes=SHAPES[:1]),
 }
 MODES = tuple(SCHEDULES)
 
 
-DTYPES = ("fp16", "bf16")
-# [tokens, 8192] is what vLLM hands a TP=8 all-reduce: hidden size 8192, token count varying with the
-# batch. 4088 straddles nothing but is deliberately NOT a power of two, and 512 is the token count at
-# which [tokens, 8192] bf16 reaches the 8 MiB admission bound -- so 511/512 sit either side of the
-# edge where the communicator starts declining and vLLM falls back.
-SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
 
 
 
@@ -378,7 +388,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
     # matters. The graph is already gone (a local of `_run`), and the caller destroys the process group
     # after this returns, so the three lifetimes nest correctly by construction.
     with _build_communicator(backend, cpu_group, group, device) as comm:
-        for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
+        for op_name, dtype_name, shape in product(OPS, DTYPES, sched.shapes):
             dtype = dtypes.d_dtypes[dtype_name]
             one = torch.empty(shape, dtype=dtype)
             where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
