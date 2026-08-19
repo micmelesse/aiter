@@ -164,7 +164,7 @@ class Measurement:
     # a fixed atol through rounding alone -- so the derived form would fail cases the ranks passed.
     within_tolerance: bool
     worst_diff: float
-    worst_at: int               # replay index of the worst divergence; -1 for eager
+    worst_slot: int             # slot index of the worst divergence; -1 if exact
     atol: float
 
 
@@ -355,7 +355,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
                 continue
             ok, diff, at = verdict
             _say(rank, f"      {where} worst|diff|={diff:g} atol={atol:g}"
-                       + (f" @replay {at}" if at >= 0 else ""))
+                       + (f" @slot {at}" if at >= 0 else ""))
             worst = (worst[0] and ok, max(worst[1], diff),
                      at if diff > worst[1] else worst[2], atol)
             torch.cuda.empty_cache()
@@ -416,8 +416,9 @@ def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
         pool.terminate()               # frees the GPUs whether it passed, failed or hung
 
     ok = all(r[0] for r in per_rank)
-    _, worst_diff, worst_at, atol = max(per_rank, key=lambda r: r[1])
-    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_at=worst_at, atol=atol)
+    _, worst_diff, worst_slot, atol = max(per_rank, key=lambda r: r[1])
+    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_slot=worst_slot,
+                       atol=atol)
 
 
 @pytest.fixture(scope="session")
