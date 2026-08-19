@@ -111,7 +111,44 @@ BACKENDS = tuple(_BACKEND_CLASS)
 # Keeping identical-input as a third mode bought exactly one thing -- telling "capture itself is
 # broken" apart from "staleness between replays" -- and `Measurement.worst_at` already gives that:
 # diverging at replay 0 is capture, at replay 1+ is staleness. Same answer, half the matrix.
-MODES = ("eager", "graph")
+# THE THREE MODES, as data. Each is a SCHEDULE the one runner interprets, so the difference between
+# them is this table rather than three code paths.
+#
+#   eager  does the collective compute the right answer AT ALL -- one call, no graph.
+#   graph  does capture/replay PRESERVE that -- one collective, many replays, fresh input each time.
+#   vllm   does the REAL pattern work -- a decode graph is a whole forward pass, so one capture holds
+#          one collective PER LAYER on its own buffer. The aim is that passing here means running in
+#          vLLM works; eager and graph exist to localise it when this one does not.
+#
+# `vllm` is a superset of `graph`: same replay depth, plus many buffers. It needs no separate
+# eager-then-graph field, because a captured mode already warms up with eager calls on the same
+# communicator before it captures -- which is what registers the staging buffer.
+VLLM_LAYERS = 8
+
+# The share of one card a single case may need for its inputs and snapshots. Multi-GPU runs OWN the
+# machine (coordinated beforehand), so a case may take most of a card -- but not so much that the
+# framework's own allocations turn a valid case into an OOM.
+MEMORY_BUDGET = 0.70
+
+
+@dataclass(frozen=True)
+class Schedule:
+    buffers: int        # distinct input buffers the collective is called on, per replay
+    replays: int        # how many times the body runs
+    captured: bool      # is the body recorded into a cudagraph and replayed
+
+    @property
+    def slots(self) -> int:
+        """Total collectives, and the index space the inputs and the judging share."""
+        return self.buffers * self.replays
+
+
+SCHEDULES = {
+    "eager": Schedule(buffers=1, replays=1, captured=False),
+    "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True),
+    "vllm": Schedule(buffers=VLLM_LAYERS, replays=GRAPH_REPLAYS, captured=True),
+}
+MODES = tuple(SCHEDULES)
 
 
 DTYPES = ("fp16", "bf16")
@@ -232,37 +269,47 @@ def _replay_input(rank, k, shape, dtype):
     return torch.randn(shape, generator=g).to(dtype)
 
 
-def _run_eager(comm, op, inputs, static_in):
-    """Call the collective once. Returns one output per input, so eager is the 1-replay case.
+def _run(comm, ops, statics, inputs, sched: Schedule):
+    """Run `sched` and return one output per SLOT, in slot order. THE only runner.
 
-    `comm` is unused, and taken anyway so both runners have ONE signature: the mode is chosen by
-    assigning a runner, and two shapes would make that assignment carry a per-mode argument list."""
-    static_in.copy_(inputs[0])
-    return [op().clone()]
+    Slot j is replay `j // buffers` on buffer `j % buffers`, which is the index the inputs are built
+    on and the one `_judge` reads -- so a mode with many buffers needs no separate judging.
 
+    When captured, the graph is a LOCAL: it must die before the process group is destroyed, or
+    `destroy_process_group` blocks forever draining work a live graph still owns. The warmup calls
+    before it are EAGER on the same communicator, which is what registers the staging buffer.
 
-def _run_graph(comm, op, inputs, static_in):
-    """Capture once, then replay with a FRESH input each time. One output per replay.
-
-    Three things this shape is load-bearing for: `comm.capture()` is required (a backend may defer
-    registration until it exits); the graph is a LOCAL so it dies before `destroy_process_group`,
-    which otherwise blocks forever draining work a live graph owns; and only a snapshot copy sits
-    between replays, because an elided end barrier needs them back-to-back to race.
+    Only a snapshot copy sits between replays, so they stay back-to-back -- an elided end barrier
+    needs that to race. Everything is checked after one sync.
     """
-    for _ in range(3):          # warm up so first-call allocations happen before capture
-        out = op()
-    torch.cuda.synchronize()
+    def body():
+        return [op() for op in ops]
 
+    def feed(replay):
+        for m, st in enumerate(statics):
+            st.copy_(inputs[replay * len(statics) + m])
+
+    if not sched.captured:
+        out = []
+        for k in range(sched.replays):
+            feed(k)
+            out += [o.clone() for o in body()]
+        return out
+
+    for _ in range(3):          # eager warmup: first-call allocations, and the staging registration
+        body()
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with comm.capture(), torch.cuda.graph(graph):
-        out = op()
-    snaps = torch.empty((len(inputs), *out.shape), dtype=out.dtype, device=out.device)
-    for k, x in enumerate(inputs):
-        static_in.copy_(x)
+        outs = body()
+    snaps = [torch.empty((sched.replays, *o.shape), dtype=o.dtype, device=o.device) for o in outs]
+    for k in range(sched.replays):
+        feed(k)
         graph.replay()
-        snaps[k].copy_(out)     # snapshot before the next replay overwrites `out`
+        for m, o in enumerate(outs):
+            snaps[m][k].copy_(o)
     torch.cuda.synchronize()
-    return [snaps[k] for k in range(len(inputs))]
+    return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs))]
 
 
 def reference(op_name, inputs, dim=-1):
@@ -329,19 +376,18 @@ def run_rank(rank, world, pp, case, init_method):
     torch.cuda.synchronize()
     comm = _build_communicator(case.backend, cpu_group, group, device)
 
-    replays = GRAPH_REPLAYS if case.mode == "graph" else 1
-    all_inputs = [[_replay_input(r, k, case.shape, case.dtype).to(device)
-                   for k in range(replays)] for r in range(world)]
+    sched = SCHEDULES[case.mode]
+    all_inputs = [[_replay_input(r, j, case.shape, case.dtype).to(device)
+                   for j in range(sched.slots)] for r in range(world)]
     mine = all_inputs[rank]
-    static_in = mine[0].clone()
-    op = _make_op(comm, case.op, static_in)
+    statics = [mine[m].clone() for m in range(sched.buffers)]
+    ops = [_make_op(comm, case.op, st) for st in statics]
 
-    runner = _run_graph if case.mode == "graph" else _run_eager
-    verdict = _judge(case.op, case.dtype, all_inputs, runner(comm, op, mine, static_in))
+    verdict = _judge(case.op, case.dtype, all_inputs, _run(comm, ops, statics, mine, sched))
 
     # The ONE teardown in the file. Anything holding graph-pool memory goes first; the graph itself
-    # is already freed by `_run_graph` having returned.
-    del all_inputs, mine, static_in, op, comm
+    # is already freed by `_run` having returned.
+    del all_inputs, mine, statics, ops, comm
     torch.cuda.synchronize()
     if dist.is_initialized():
         destroy_model_parallel()
@@ -350,82 +396,10 @@ def run_rank(rank, world, pp, case, init_method):
     return verdict
 
 
-VLLM_BUCKETS = ((4, 8192), (8, 8192), (16, 8192), (32, 8192), (64, 8192), (128, 8192))
-LIFETIME_ROUNDS = 4
-
-
-def run_rank_lifetime(rank, world, pp, backend, dtype, init_method):
-    """ONE communicator for its whole life: eager first, then a graph PER shape, then all of them
-    replayed in rounds. Returns the worst verdict over everything it did.
-
-    This is vLLM's pattern and nothing else here tests it. vLLM builds one communicator, runs prefill
-    EAGER through it, captures one graph per batch-size bucket (~50 of them), and then replays those
-    graphs for hours. Every other test in this file builds a fresh communicator, captures at most one
-    graph, and tears down -- so three things it depends on have never run: `flush_pending` called more
-    than once, a slot allocated per capture without being reused or leaked, and the eagerly-registered
-    staging buffer coexisting with capture-time registrations.
-    """
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    init_distributed_environment(world_size=world, rank=rank,
-                                 distributed_init_method=init_method)
-    ensure_model_parallel_initialized(world, pp)
-    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
-    comm = _build_communicator(backend, cpu_group, group, device)
-
-    worst = (True, 0.0, -1, 0.0)
-    def fold(v):
-        nonlocal worst
-        worst = (worst[0] and v[0], max(worst[1], v[1]), v[2] if v[1] > worst[1] else worst[2], v[3])
-
-    # PREFILL first, eager, exactly as vLLM does before it captures anything. Scoped for the same
-    # reason as `_decode`: nothing device-side outlives the phase that made it.
-    def _prefill() -> None:
-        for shape in VLLM_BUCKETS[:2]:
-            alls = [[_replay_input(r, 0, shape, dtype).to(device)] for r in range(world)]
-            static = alls[rank][0].clone()
-            op = _make_op(comm, "all_reduce", static)
-            fold(_judge("all_reduce", dtype, alls, _run_eager(comm, op, alls[rank], static)))
-
-    _prefill()
-
-    # DECODE, in a NESTED FUNCTION so every graph, output and static buffer dies with its frame.
-    # Not tidiness: a live captured graph holds the communicator's work and `destroy_process_group`
-    # then blocks forever draining it. A loop variable is enough to keep one alive -- `del graphs`
-    # would not have, because `for g, ..., out in graphs` leaves those names bound afterwards.
-    def _decode() -> None:
-        graphs = []
-        for shape in VLLM_BUCKETS:
-            alls = [[_replay_input(r, k, shape, dtype).to(device) for k in range(LIFETIME_ROUNDS)]
-                    for r in range(world)]
-            static = alls[rank][0].clone()
-            op = _make_op(comm, "all_reduce", static)
-            for _ in range(3):
-                op()
-            torch.cuda.synchronize()
-            g = torch.cuda.CUDAGraph()
-            with comm.capture(), torch.cuda.graph(g):
-                out = op()
-            graphs.append((g, alls, static, out))
-        # Replayed in ROUNDS, every graph each round: a slot a later capture overwrote shows up as an
-        # earlier graph going wrong, which one-graph-at-a-time could never see.
-        for rnd in range(LIFETIME_ROUNDS):
-            for g, alls, static, out in graphs:
-                static.copy_(alls[rank][rnd])
-                g.replay()
-                torch.cuda.synchronize()
-                fold(_judge("all_reduce", dtype, [[a[rnd]] for a in alls], [out.clone()]))
-
-    _decode()
-    del comm
-    torch.cuda.synchronize()
-    if dist.is_initialized():
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        torch.cuda.empty_cache()
-    return worst
+# `run_rank_lifetime` and `test_one_communicator_survives_a_vllm_shaped_lifetime` were here, a second
+# rank worker that captured a graph per shape. Replaced by the `vllm` SCHEDULE, which reaches the same
+# property through the one code path -- and at full replay depth, where the separate test ran 4 rounds
+# and would have missed a staleness race that needs ~80.
 
 
 def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Measurement:
@@ -541,6 +515,18 @@ def test_collective_matches_the_reference(backend: str, op: str, dtype: str,
     if not probe.should_allreduce(torch.empty(shape, dtype=torch_dtype)):
         nbytes = torch.empty(shape, dtype=torch_dtype).numel() * torch.empty(0, dtype=torch_dtype).element_size()
         pytest.skip(f"outside the envelope: {nbytes} bytes, bound is {BASELINE_MAX_SIZE}")
+    # Every rank materialises EVERY rank's input for every slot, plus one snapshot per slot -- and an
+    # all_gather output is world_size x its input. At `vllm`'s 1600 slots that reaches ~200G of a 288G
+    # card, which fits an OWNED box and nothing less. Reported as a skip rather than left to OOM
+    # twenty minutes in, because the footprint is arithmetic and can be known before spawning.
+    sched = SCHEDULES[mode]
+    fan = world if op == "all_gather" else 1
+    per_slot = torch.empty(shape, dtype=torch_dtype).numel() * torch.empty(0, dtype=torch_dtype).element_size()
+    need = sched.slots * per_slot * (world + fan)
+    budget = int(torch.cuda.get_device_properties(0).total_memory * MEMORY_BUDGET)
+    if need > budget:
+        pytest.skip(f"{need / 2**30:.0f}G needed, budget {budget / 2**30:.0f}G "
+                    f"({sched.slots} slots x {per_slot} B x (world {world} + fan {fan}))")
     addr, port = rendezvous
     case = Case(backend=backend, op=op, dtype=torch_dtype, shape=shape, mode=mode)
     got = run_case(case, world=world, addr=addr, port=port)
@@ -550,32 +536,3 @@ def test_collective_matches_the_reference(backend: str, op: str, dtype: str,
     print(f"      {case}  worst|diff|={got.worst_diff:g}  atol={got.atol:g}"
           + (f"  @replay {got.worst_at}" if got.worst_at >= 0 else ""), flush=True)
     assert got.within_tolerance, f"{case}: outside tolerance (numbers above)"
-
-
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_one_communicator_survives_a_vllm_shaped_lifetime(backend: str, world: int,
-                                                          rendezvous: Tuple[str, int]) -> None:
-    """Eager, then a graph per batch bucket, then all of them replayed -- on ONE communicator.
-
-    The gate before any vLLM run: every other test tears the communicator down after one capture, so
-    this is the only one that exercises repeated deferred registration and the slot accounting behind
-    it. See `run_rank_lifetime`.
-    """
-    if world < 2:
-        pytest.skip("a collective needs at least two ranks")
-    addr, port = rendezvous
-    pool = Pool(processes=world)
-    init = get_distributed_init_method(addr, port)
-    try:
-        rets = [pool.apply_async(run_rank_lifetime,
-                                 args=(r, world, 1, backend, torch.bfloat16, init))
-                for r in range(world)]
-        pool.close()
-        per_rank = _collect(pool, rets)
-    finally:
-        pool.terminate()
-    ok = all(r[0] for r in per_rank)
-    _, worst_diff, worst_at, atol = max(per_rank, key=lambda r: r[1])
-    print(f"      {backend:5} lifetime: {len(VLLM_BUCKETS)} graphs x {LIFETIME_ROUNDS} rounds  "
-          f"worst|diff|={worst_diff:g}  atol={atol:g}", flush=True)
-    assert ok, f"{backend} drifted over its lifetime: worst|diff|={worst_diff:g} atol={atol:g}"
