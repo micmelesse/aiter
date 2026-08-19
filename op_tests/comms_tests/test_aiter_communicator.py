@@ -357,9 +357,9 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
 
     It owns the whole lifetime because construction and teardown are two of the ways a communicator
     fails, not setup around the part that counts: building one is a COLLECTIVE (hip exchanges IPC
-    handles, so a non-uniform failure hangs rather than errors), and teardown is where a live captured
-    graph makes `destroy_process_group` block forever. Owning both also puts the ORDER beyond reach --
-    the communicator is gone before the caller destroys the group, by nesting rather than by comment.
+    handles, so a non-uniform failure hangs rather than errors), and teardown releases those handles.
+    Owning both puts the ORDER beyond reach -- the communicator is closed before the caller destroys
+    the group, by nesting rather than by comment.
 
     ONE instance does every cell, which is both the question worth asking and what vLLM does: it drives
     all_reduce and all_gather through a single communicator for the life of the server, so exercising
@@ -370,10 +370,14 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
     nested scope so its tensors die with the frame -- at `vllm`'s 1600 slots one cell can hold most of
     a card, and the next needs that memory back.
     """
-    comm = _build_communicator(backend, cpu_group, group, device)
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
     worst = (True, 0.0, -1, 0.0)
-    try:
+    # `with`, so the release is in the SYNTAX: `Communicator.close()` runs at block exit whatever
+    # happens inside, where `del` would only release if nothing else held a reference -- and a failing
+    # cell's traceback holds the frames that hold the communicator, so `del` fails exactly when it
+    # matters. The graph is already gone (a local of `_run`), and the caller destroys the process group
+    # after this returns, so the three lifetimes nest correctly by construction.
+    with _build_communicator(backend, cpu_group, group, device) as comm:
         for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
             dtype = dtypes.d_dtypes[dtype_name]
             one = torch.empty(shape, dtype=dtype)
@@ -408,13 +412,9 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
             worst = (worst[0] and ok, max(worst[1], diff),
                      at if diff > worst[1] else worst[2], atol)
             torch.cuda.empty_cache()
-        return worst
-    finally:
-        # FINALLY, so a cell that raises still frees the communicator: anything holding graph-pool
-        # memory has to go before the caller tears the process group down.
-        del comm
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    return worst
 
 
 def run_rank(rank, world, pp, backend, mode, init_method):

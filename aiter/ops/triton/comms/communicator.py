@@ -3,6 +3,7 @@
 
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Iterator, Optional, Union
@@ -61,12 +62,13 @@ class Communicator(ABC):
     # a shape outside the envelope would run on torch and fall back on the others.
     _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
-    # A class attribute, so a backend needs no cooperating `__init__` to get the invariant.
+    # Class attributes, so a backend needs no cooperating `__init__` to get either invariant.
     _capturing: bool = False
+    _closed: bool = False
 
     # Checked when the class is DEFINED, the earliest moment there is.
     _CALLERS_SURFACE = ("should_allreduce", "should_allgather", "all_reduce", "all_gather", "capture",
-                        "_admits")
+                        "_admits", "close", "__enter__", "__exit__")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -75,7 +77,8 @@ class Communicator(ABC):
             raise TypeError(
                 f"{cls.__name__} overrides {taken}, which `Communicator` owns -- an override skips "
                 f"the capture invariant and the admission gate. Supply `_all_reduce`, `_all_gather`, "
-                f"or `_on_capture` instead -- admission is not a backend's to redefine."
+                f"`_on_capture` or `_on_close` instead -- admission and lifetime are not a "
+                f"backend's to redefine."
             )
 
     # ---- What the CALLER uses. Concrete: this class owns the order. ----
@@ -117,6 +120,42 @@ class Communicator(ABC):
         if not self.should_allgather(inp):
             raise RuntimeError(self._rejected("all_gather", inp))
         return self._all_gather(inp, dim)
+
+    def close(self) -> None:
+        """Release what this communicator holds, NOW. Idempotent, and safe to call on a disabled one.
+
+        Deterministic release rather than waiting to be collected, because the collection is what
+        cannot be relied on: dropping the last reference frees a backend's IPC handles and device
+        buffers through its destructor, but an exception TRACEBACK holds the frames that hold the
+        communicator -- so a failing call is exactly when `del` does not release. This does.
+
+        LOCAL only, deliberately: nothing here coordinates across ranks, so a rank closing early or
+        late cannot hang its peers. Ordering that does matter is the caller's -- close before the
+        process group is destroyed, and after any captured graph is gone.
+        """
+        if self._closed:
+            return
+        if self._capturing:
+            raise RuntimeError(
+                f"{type(self).__name__}.close() inside `capture()`: the graph being recorded would "
+                f"replay against released buffers. Leave the capture first.")
+        self._closed = True
+        self._on_close()
+
+    def __enter__(self) -> "Communicator":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # WARNS, never releases. Doing GPU or IPC work here would run at an arbitrary moment --
+        # interpreter shutdown included, where the runtime may already be gone -- so this only reports
+        # that a release was left to chance. Same bargain as an unclosed file's ResourceWarning.
+        if not self._closed and not getattr(self, "disabled", True):
+            warnings.warn(f"{type(self).__name__} was never closed; its peer handles and buffers were "
+                          f"left to garbage collection. Use `with make_communicator(...) as comm:` "
+                          f"or call `close()`.", ResourceWarning, stacklevel=2)
 
     @contextmanager
     def capture(self) -> Iterator[None]:
@@ -161,6 +200,10 @@ class Communicator(ABC):
     def _on_capture(self) -> AbstractContextManager[None]:
         """What this backend needs around a capture. Nothing, by default."""
         return nullcontext()
+
+    def _on_close(self) -> None:
+        """What this backend has to release. Nothing, by default -- torch.distributed holds nothing
+        of ours, and a backend that does drops it here so its destructor runs at a known moment."""
 
 
 class IrisCommunicator(Communicator):
@@ -346,6 +389,14 @@ class IrisCommunicator(Communicator):
             )
             raise
 
+    def _on_close(self) -> None:
+        # The symmetric heap NEVER frees, so its slabs live as long as it does -- dropping the heap is
+        # the only way to give the memory back, and it has to go last.
+        self._buf_shape = self._buf_dtype = None
+        self._ag_input_slab = self._ag_output_slab = None
+        self._shmem = None
+        self.disabled = True
+
     # No `_on_capture`: iris needs nothing around a capture.
 
 
@@ -483,6 +534,13 @@ class HipCommunicator(Communicator):
         # A captured input's address is not registered when the launch is recorded, so the context
         # reserves a slot during capture and exchanges the IPC handles on the way out.
         return self._comms.capture()
+
+    def _on_close(self) -> None:
+        # Dropping this runs `~Comms()`, which calls `hipIpcCloseMemHandle` on every peer base it
+        # opened. That is the release worth being deterministic about: the handles are a per-process
+        # resource, and a construct/destroy cycle that leaks them fails later and elsewhere.
+        self._comms = None
+        self.disabled = True
 
 
 def make_communicator(
