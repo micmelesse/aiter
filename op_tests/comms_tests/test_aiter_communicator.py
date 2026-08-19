@@ -21,6 +21,7 @@ the dropped/stale all_gather race the identical-input loop misses.
 """
 
 import logging
+from functools import partial
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
@@ -77,61 +78,40 @@ BASELINE_MAX_SIZE = 8 * 1024 * 1024      # CustomAllreduce's default max_size
 BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 16"
 
 
-@dataclass(frozen=True)
-class Op:
-    """ONE collective, and everything that varies by which one it is.
+# THE COMMUNICATOR'S API, and the test is a sweep over it. A name is both the collective to call and,
+# with the underscores dropped, the gate to ask (`all_reduce` / `should_allreduce`), so `getattr` needs
+# no table -- and renaming the API breaks this loudly instead of testing something else quietly.
+OPS = ("all_reduce", "all_gather")
 
-    A TABLE for the same reason `_BACKEND_CLASS` is one: `op` used to be a bare string switched on in
-    five places -- twice to build the call, twice for the reference, once for the tolerance, and once
-    for the memory estimate -- so a third collective meant finding all five. Here it is one entry.
 
-    Module-level functions rather than lambdas because a `Case` crosses a process boundary: `Case.op`
-    stays the NAME and the worker looks the entry up, exactly as `backend` does.
+
+
+
+
+def _expected(op_name, inputs):
+    """What every rank should hold after `op_name`. The ONE thing that genuinely differs per
+    collective and is not derivable from the API: what the right answer IS.
+
+    all_reduce sums, accumulated in fp32 so the reference does not itself eat bf16 rounding.
+    all_gather concatenates rank-ordered along the last axis -- the `Communicator.all_gather`
+    contract, identical for every backend.
     """
-    admits: Callable          # comm, tensor -> may this backend take it
-    invoke: Callable          # comm, tensor -> the collective's output
-    reference: Callable       # every rank's input -> what each should hold afterwards
-    atol: Callable            # dtype -> absolute tolerance
-    fans_out: bool              # is the output world_size x the input (a gather) or 1x (a reduce)
-
-def _sum_in_fp32(inputs):
-    """all_reduce's answer, accumulated in fp32 so the REFERENCE does not itself eat bf16 rounding."""
-    acc = torch.zeros_like(inputs[0], dtype=torch.float32)
-    for x in inputs:
-        acc += x.to(torch.float32)
-    return acc.to(inputs[0].dtype)
-
-
-def _concat_rank_ordered(inputs):
-    """all_gather's answer: the per-rank inputs along the last axis, rank-ordered -- the
-    `Communicator.all_gather` contract, identical for every backend."""
+    if op_name == "all_reduce":
+        acc = torch.zeros_like(inputs[0], dtype=torch.float32)
+        for x in inputs:
+            acc += x.to(torch.float32)
+        return acc.to(inputs[0].dtype)
     return torch.cat(inputs, dim=-1)
 
 
-def _reduce_atol(dtype):
-    """all_reduce sums world_size values, and bf16's 7-bit mantissa (ULP ~8x fp16's) makes
-    tree-vs-sequential accumulation diverge by a few ULPs -- benign, but a *correct* bf16 reduce needs
-    a dtype-aware tolerance or it reads as a failure. A real bug is orders of magnitude beyond this."""
+def _atol(op_name, dtype):
+    """all_gather is data movement, so effectively exact. all_reduce sums world_size values, and
+    bf16's 7-bit mantissa (ULP ~8x fp16's) makes tree-vs-sequential accumulation diverge by a few
+    ULPs -- benign, but a CORRECT bf16 reduce needs a dtype-aware tolerance or it reads as a failure.
+    A real bug is orders of magnitude past this."""
+    if op_name == "all_gather":
+        return 1e-3
     return 0.1 if dtype == torch.bfloat16 else 0.01
-
-
-_OP = {
-    "all_reduce": Op(
-        admits=lambda c, x: c.should_allreduce(x),
-        invoke=lambda c, x: c.all_reduce(x),
-        reference=_sum_in_fp32,
-        atol=_reduce_atol,
-        fans_out=False,
-    ),
-    "all_gather": Op(
-        admits=lambda c, x: c.should_allgather(x),
-        invoke=lambda c, x: c.all_gather(x),
-        reference=_concat_rank_ordered,
-        atol=lambda dtype: 1e-3,        # pure data movement, so effectively exact
-        fans_out=True,
-    ),
-}
-OPS = tuple(_OP)
 
 
 # ── Communicator: one interface, three impls, one branching point ──
@@ -227,20 +207,6 @@ DTYPES = ("fp16", "bf16")
 SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
 
 
-@dataclass(frozen=True)
-class Case:
-    """ONE unit of work: which backend, which collective, at what dtype and shape, replayed how.
-
-    """
-
-    backend: str
-    op: str
-    dtype: "torch.dtype"
-    shape: Tuple[int, ...]
-    mode: str
-
-    def __str__(self) -> str:
-        return f"{self.backend:5} {self.op:11} {str(self.shape):12} {str(self.dtype):14} {self.mode}"
 
 
 @dataclass(frozen=True)
@@ -279,16 +245,6 @@ def _build_communicator(backend, cpu_group, device_group, device):
         raise RuntimeError(f"{backend} communicator disabled")
     return comm
 
-
-def _make_op(comm, op_name, x):
-    """The collective under test as a zero-arg closure over the rank's input, after enforcing the
-    communicator's own admission. A REFUSAL raises: `should_*` is the caller's question, and a caller
-    that skipped asking is a bug in this file, not a property of the backend."""
-    op = _OP[op_name]
-    if not op.admits(comm, x):
-        raise RuntimeError(
-            f"{type(comm).__name__} rejected {op_name}: shape={tuple(x.shape)} dtype={x.dtype}")
-    return lambda: op.invoke(comm, x)
 
 
 def _collect(pool, rets):
@@ -374,11 +330,10 @@ def _judge(op_name, dtype, all_inputs, got):
     `worst_at` is the diagnostic that let the identical-input mode be deleted -- diverging at replay
     0 means capture is wrong, at replay 1+ means a stale read between replays.
     """
-    op = _OP[op_name]
-    atol, rtol = op.atol(dtype), 0.01
+    atol, rtol = _atol(op_name, dtype), 0.01
     ok, worst_diff, worst_at = True, 0.0, -1
     for k, mine in enumerate(got):
-        ref = op.reference([all_inputs[r][k] for r in range(len(all_inputs))]).to(torch.float32)
+        ref = _expected(op_name, [all_inputs[r][k] for r in range(len(all_inputs))]).to(torch.float32)
         cur = mine.to(torch.float32)
         d = (cur - ref).abs().max().item()
         if d > worst_diff:
@@ -388,35 +343,87 @@ def _judge(op_name, dtype, all_inputs, got):
     return ok, worst_diff, worst_at, atol
 
 
-def run_rank(rank, world, pp, case, init_method):
-    """ONE per-rank worker for EVERY case. Bring up, run the mode, judge, tear down.
+def exercise(comm, sched: Schedule, world: int, rank: int, device) -> tuple:
+    """Put a communicator through its whole API and return the worst verdict. THE definition of
+    "does this communicator work".
 
-    Every rank rebuilds every rank's input from a seed, so it can compute the reference itself and
-    judge its own replays. Only scalars cross the process boundary.
+    ONE instance does every collective at every dtype and shape, which is both the question worth
+    asking and what vLLM actually does -- it drives all_reduce and all_gather through a single
+    communicator for the life of the server, so testing them on separate instances tests something
+    easier than production.
+
+    A cell the communicator DECLINES, or one too large for the memory budget, is reported and skipped
+    rather than failed: declining is correct behaviour, and the footprint is arithmetic.
+
+    Each cell runs in a nested scope so its tensors die with the frame -- at `vllm`'s 1600 slots one
+    cell can hold most of a card, and the next cell needs that memory back.
+    """
+    worst = (True, 0.0, -1, 0.0)
+    budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
+
+    for op_name in OPS:
+        gate = getattr(comm, f"should_{op_name.replace('_', '')}")
+        for dtype_name in DTYPES:
+            dtype = dtypes.d_dtypes[dtype_name]
+            for shape in SHAPES:
+                one = torch.empty(shape, dtype=dtype)
+                if not gate(one):
+                    if rank == 0:
+                        print(f"      - {op_name} {dtype_name} {shape}: declined by the communicator",
+                              flush=True)
+                    continue
+                # Every rank materialises every rank's input for every slot, plus one snapshot each,
+                # and a gather's output is world_size x its input.
+                fan = _expected(op_name, [one] * world).numel() // one.numel()
+                need = sched.slots * one.numel() * one.element_size() * (world + fan)
+                if need > budget:
+                    if rank == 0:
+                        print(f"      - {op_name} {dtype_name} {shape}: needs {need / 2**30:.0f}G, "
+                              f"budget {budget / 2**30:.0f}G", flush=True)
+                    continue
+
+                def cell():
+                    all_inputs = [[_replay_input(r, j, shape, dtype).to(device)
+                                   for j in range(sched.slots)] for r in range(world)]
+                    mine = all_inputs[rank]
+                    statics = [mine[m].clone() for m in range(sched.buffers)]
+                    # `partial` on the API itself. No wrapper re-checks admission: the communicator
+                    # enforces its own envelope and raises, so a check here would restate that.
+                    ops = [partial(getattr(comm, op_name), st) for st in statics]
+                    return _judge(op_name, dtype, all_inputs, _run(comm, ops, statics, mine, sched))
+
+                v = cell()
+                if rank == 0:
+                    print(f"      {op_name:11} {dtype_name:5} {str(shape):12} "
+                          f"worst|diff|={v[1]:g} atol={v[3]:g}"
+                          + (f" @replay {v[2]}" if v[2] >= 0 else ""), flush=True)
+                worst = (worst[0] and v[0], max(worst[1], v[1]),
+                         v[2] if v[1] > worst[1] else worst[2], v[3])
+                torch.cuda.empty_cache()
+    return worst
+
+
+def run_rank(rank, world, pp, backend, mode, init_method):
+    """ONE per-rank worker: bring the group up, build the communicator, exercise it, tear down.
+
+    Every rank rebuilds every rank's input from a seed, so it judges its own replays and only scalars
+    cross the process boundary.
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     init_distributed_environment(world_size=world, rank=rank,
                                  distributed_init_method=init_method)
     ensure_model_parallel_initialized(world, pp)
-    cpu_group = get_tp_group().cpu_group
-    group = get_tp_group().device_group
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)     # force comm init before we measure
     torch.cuda.synchronize()
-    comm = _build_communicator(case.backend, cpu_group, group, device)
+    comm = _build_communicator(backend, cpu_group, group, device)
 
-    sched = SCHEDULES[case.mode]
-    all_inputs = [[_replay_input(r, j, case.shape, case.dtype).to(device)
-                   for j in range(sched.slots)] for r in range(world)]
-    mine = all_inputs[rank]
-    statics = [mine[m].clone() for m in range(sched.buffers)]
-    ops = [_make_op(comm, case.op, st) for st in statics]
+    verdict = exercise(comm, SCHEDULES[mode], world, rank, device)
 
-    verdict = _judge(case.op, case.dtype, all_inputs, _run(comm, ops, statics, mine, sched))
-
-    # The ONE teardown in the file. Anything holding graph-pool memory goes first; the graph itself
-    # is already freed by `_run` having returned.
-    del all_inputs, mine, statics, ops, comm
+    # The ONE teardown. The graph is already freed by `_run` having returned, and each cell's tensors
+    # by its frame -- a live captured graph makes `destroy_process_group` block forever.
+    del comm
     torch.cuda.synchronize()
     if dist.is_initialized():
         destroy_model_parallel()
@@ -425,33 +432,25 @@ def run_rank(rank, world, pp, case, init_method):
     return verdict
 
 
-# `run_rank_lifetime` and `test_one_communicator_survives_a_vllm_shaped_lifetime` were here, a second
-# rank worker that captured a graph per shape. Replaced by the `vllm` SCHEDULE, which reaches the same
-# property through the one code path -- and at full replay depth, where the separate test ran 4 rounds
-# and would have missed a staleness race that needs ~80.
+def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
+                     pp: int = 1) -> Measurement:
+    """Exercise one backend in one mode across `world` ranks: spawn, collect under a timeout, take
+    the worst rank's numbers.
 
-
-def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Measurement:
-    """Run ONE case across `world` ranks: spawn, collect under a timeout, take the worst rank's.
-
-    It RAISES: one case per test makes pytest the boundary that turns a failure -- a timeout
-    included -- into one red result rather than the end of the run.
+    It RAISES. pytest is the boundary that turns a failure -- a timeout included -- into one red
+    result. A collective's bug is often visible on only a subset of ranks, so the verdict is the
+    WORST rank's and it passes only if every rank passed.
     """
-    # The rendezvous, and the ONLY channel for it. Deliberately not `MASTER_ADDR`/`MASTER_PORT`:
-    # nothing in `aiter.dist` reads those, and torch consults them only for `init_method="env://"`.
-    # A free port per case is what keeps two runs on a shared box from colliding.
     pool = Pool(processes=world)
     init = get_distributed_init_method(addr, port)
     try:
-        rets = [pool.apply_async(run_rank, args=(r, world, pp, case, init)) for r in range(world)]
+        rets = [pool.apply_async(run_rank, args=(r, world, pp, backend, mode, init))
+                for r in range(world)]
         pool.close()
         per_rank = _collect(pool, rets)
     finally:
-        pool.terminate()               # frees the GPUs whether the case passed, failed or hung
+        pool.terminate()               # frees the GPUs whether it passed, failed or hung
 
-    # EVERY rank's verdict, reduced to the worst. A collective's bug is often visible on only a
-    # subset of ranks (a distance/topology effect), so one rank's view is a single data point --
-    # the case passes only if every rank passed.
     ok = all(r[0] for r in per_rank)
     _, worst_diff, worst_at, atol = max(per_rank, key=lambda r: r[1])
     return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_at=worst_at, atol=atol)
@@ -505,48 +504,20 @@ def test_admission_matches_the_baseline(world_size: int) -> None:
 
 
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "x".join(map(str, s)))
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("op", OPS)
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_collective_matches_the_reference(backend: str, op: str, dtype: str,
-                                          shape: Tuple[int, ...], mode: str,
-                                          world: int, rendezvous: Tuple[str, int]) -> None:
-    """ONE case: one backend's one collective, at one dtype and shape, in one mode.
+def test_communicator(backend: str, mode: str, world: int, rendezvous: Tuple[str, int]) -> None:
+    """Does this communicator work? One instance, its whole API, in one mode.
 
-    A test PER CASE, so a hang or a fault is one red result rather than the end of the run, and
-    `-k` selects instead of a flag. BACKEND is the outermost parameter, so the control runs first:
-    if torch is red, nothing after it means anything.
+    Not parameterised per collective or per shape: `exercise` sweeps those on ONE communicator, which
+    is what vLLM does, and it prints each cell's `worst|diff|` so a failure names the cell without
+    needing 96 pytest ids. MODE is the ladder -- if `vllm` is red and `eager`/`graph` are green, the
+    pattern is at fault rather than the arithmetic. BACKEND is outermost, so torch runs first: if the
+    control is red, nothing after it means anything.
     """
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
-    torch_dtype = dtypes.d_dtypes[dtype]
-    # A shape the communicator DECLINES is correct behaviour -- vLLM falls back -- so it skips rather
-    # than fails. Asked before spawning, because admission is a pure function of the tensor and needs
-    # no ranks: [512, 8192] bf16 is exactly 8 MiB and the first size past the bound.
-    probe = object.__new__(TorchCommunicator)
-    probe.disabled, probe.world_size, probe.max_size = False, world, BASELINE_MAX_SIZE
-    if not probe.should_allreduce(torch.empty(shape, dtype=torch_dtype)):
-        nbytes = torch.empty(shape, dtype=torch_dtype).numel() * torch.empty(0, dtype=torch_dtype).element_size()
-        pytest.skip(f"outside the envelope: {nbytes} bytes, bound is {BASELINE_MAX_SIZE}")
-    # Every rank materialises EVERY rank's input for every slot, plus one snapshot per slot -- and an
-    # all_gather output is world_size x its input. At `vllm`'s 1600 slots that reaches ~200G of a 288G
-    # card, which fits an OWNED box and nothing less. Reported as a skip rather than left to OOM
-    # twenty minutes in, because the footprint is arithmetic and can be known before spawning.
-    sched = SCHEDULES[mode]
-    fan = world if _OP[op].fans_out else 1
-    per_slot = torch.empty(shape, dtype=torch_dtype).numel() * torch.empty(0, dtype=torch_dtype).element_size()
-    need = sched.slots * per_slot * (world + fan)
-    budget = int(torch.cuda.get_device_properties(0).total_memory * MEMORY_BUDGET)
-    if need > budget:
-        pytest.skip(f"{need / 2**30:.0f}G needed, budget {budget / 2**30:.0f}G "
-                    f"({sched.slots} slots x {per_slot} B x (world {world} + fan {fan}))")
     addr, port = rendezvous
-    case = Case(backend=backend, op=op, dtype=torch_dtype, shape=shape, mode=mode)
-    got = run_case(case, world=world, addr=addr, port=port)
-    # PRINTED on success too. pytest reports a pass as a dot, which says the case ran and nothing about
-    # by how much it passed -- and "within tolerance" and "bit exact" are different findings about a
-    # collective. `-s` in the workload is what lets this reach the log.
-    print(f"      {case}  worst|diff|={got.worst_diff:g}  atol={got.atol:g}"
-          + (f"  @replay {got.worst_at}" if got.worst_at >= 0 else ""), flush=True)
-    assert got.within_tolerance, f"{case}: outside tolerance (numbers above)"
+    print(f"\n  {backend} / {mode}", flush=True)
+    got = run_communicator(backend, mode, world, addr, port)
+    print(f"      => worst|diff|={got.worst_diff:g} atol={got.atol:g}", flush=True)
+    assert got.within_tolerance, f"{backend}/{mode}: outside tolerance (cells above)"
