@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import multiprocessing as mp
 import time
 from multiprocessing import Pool, set_start_method
-from typing import Tuple
+from typing import Callable, Tuple
 
 import pytest
 import torch
@@ -63,7 +63,75 @@ CASE_TIMEOUT_S = 600
 # Deterministic per-(rank, replay) seed base for the varying-input check.
 _INPUT_SEED = 20260615
 
-OPS = ["all_reduce", "all_gather"]
+# The admission parameters CustomAllreduce uses, RECORDED here. That is the path these backends
+# replace, so it is the envelope they have to match, and writing the numbers down is what makes the
+# match reviewable. aiter must not IMPORT vllm to get them -- vllm depends on aiter, not the reverse.
+#
+# From vllm/distributed/device_communicators/custom_all_reduce.py, `should_custom_ar`:
+#     inp_size % 16 == 0, is_weak_contiguous(inp), and inp_size < self.max_size (default 8 MiB).
+#
+# NOT from `aiter/dist/device_communicators/custom_all_reduce.py`, which is a modified fork: it
+# hardcodes `fully_connected`, splits the bound with an `8192*8192` constant, and adds a
+# `should_custom_ag` upstream does not have. Reading it as the reference produced two wrong bounds.
+BASELINE_MAX_SIZE = 8 * 1024 * 1024      # CustomAllreduce's default max_size
+BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 16"
+
+
+@dataclass(frozen=True)
+class Op:
+    """ONE collective, and everything that varies by which one it is.
+
+    A TABLE for the same reason `_BACKEND_CLASS` is one: `op` used to be a bare string switched on in
+    five places -- twice to build the call, twice for the reference, once for the tolerance, and once
+    for the memory estimate -- so a third collective meant finding all five. Here it is one entry.
+
+    Module-level functions rather than lambdas because a `Case` crosses a process boundary: `Case.op`
+    stays the NAME and the worker looks the entry up, exactly as `backend` does.
+    """
+    admits: Callable          # comm, tensor -> may this backend take it
+    invoke: Callable          # comm, tensor -> the collective's output
+    reference: Callable       # every rank's input -> what each should hold afterwards
+    atol: Callable            # dtype -> absolute tolerance
+    fans_out: bool              # is the output world_size x the input (a gather) or 1x (a reduce)
+
+def _sum_in_fp32(inputs):
+    """all_reduce's answer, accumulated in fp32 so the REFERENCE does not itself eat bf16 rounding."""
+    acc = torch.zeros_like(inputs[0], dtype=torch.float32)
+    for x in inputs:
+        acc += x.to(torch.float32)
+    return acc.to(inputs[0].dtype)
+
+
+def _concat_rank_ordered(inputs):
+    """all_gather's answer: the per-rank inputs along the last axis, rank-ordered -- the
+    `Communicator.all_gather` contract, identical for every backend."""
+    return torch.cat(inputs, dim=-1)
+
+
+def _reduce_atol(dtype):
+    """all_reduce sums world_size values, and bf16's 7-bit mantissa (ULP ~8x fp16's) makes
+    tree-vs-sequential accumulation diverge by a few ULPs -- benign, but a *correct* bf16 reduce needs
+    a dtype-aware tolerance or it reads as a failure. A real bug is orders of magnitude beyond this."""
+    return 0.1 if dtype == torch.bfloat16 else 0.01
+
+
+_OP = {
+    "all_reduce": Op(
+        admits=lambda c, x: c.should_allreduce(x),
+        invoke=lambda c, x: c.all_reduce(x),
+        reference=_sum_in_fp32,
+        atol=_reduce_atol,
+        fans_out=False,
+    ),
+    "all_gather": Op(
+        admits=lambda c, x: c.should_allgather(x),
+        invoke=lambda c, x: c.all_gather(x),
+        reference=_concat_rank_ordered,
+        atol=lambda dtype: 1e-3,        # pure data movement, so effectively exact
+        fans_out=True,
+    ),
+}
+OPS = tuple(_OP)
 
 
 # ── Communicator: one interface, three impls, one branching point ──
@@ -194,11 +262,6 @@ class Measurement:
 
 
 
-
-
-
-
-
 def _build_communicator(backend, cpu_group, device_group, device):
     comm = make_communicator(cpu_group, device_group, device, backend=backend)
     # Every test funnels through here, so this one assertion covers the mapping at every
@@ -218,23 +281,14 @@ def _build_communicator(backend, cpu_group, device_group, device):
 
 
 def _make_op(comm, op_name, x):
-    """The collective under test as a zero-arg closure over the rank's input,
-    after enforcing the communicator's own should_* precondition."""
-    if op_name == "all_reduce":
-        if not comm.should_allreduce(x):
-            raise RuntimeError(
-                f"{type(comm).__name__} rejected all_reduce: "
-                f"shape={tuple(x.shape)} dtype={x.dtype}"
-            )
-        return lambda: comm.all_reduce(x)
-    if op_name == "all_gather":
-        if not comm.should_allgather(x):
-            raise RuntimeError(
-                f"{type(comm).__name__} rejected all_gather: "
-                f"shape={tuple(x.shape)} dtype={x.dtype}"
-            )
-        return lambda: comm.all_gather(x)
-    raise ValueError(f"unknown op {op_name!r}")
+    """The collective under test as a zero-arg closure over the rank's input, after enforcing the
+    communicator's own admission. A REFUSAL raises: `should_*` is the caller's question, and a caller
+    that skipped asking is a bug in this file, not a property of the backend."""
+    op = _OP[op_name]
+    if not op.admits(comm, x):
+        raise RuntimeError(
+            f"{type(comm).__name__} rejected {op_name}: shape={tuple(x.shape)} dtype={x.dtype}")
+    return lambda: op.invoke(comm, x)
 
 
 def _collect(pool, rets):
@@ -312,32 +366,6 @@ def _run(comm, ops, statics, inputs, sched: Schedule):
     return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs))]
 
 
-def reference(op_name, inputs, dim=-1):
-    """What every rank should hold afterwards. all_reduce = elementwise sum
-    (accumulated in fp32 so the reference itself doesn't eat bf16 rounding);
-    all_gather = concat of the per-rank inputs along `dim`, rank-ordered (the
-    Communicator.all_gather contract, same for every backend)."""
-    if op_name == "all_reduce":
-        acc = torch.zeros_like(inputs[0], dtype=torch.float32)
-        for x in inputs:
-            acc += x.to(torch.float32)
-        return acc.to(inputs[0].dtype)
-    if op_name == "all_gather":
-        return torch.cat(inputs, dim=dim)
-    raise ValueError(f"unknown op {op_name!r}")
-
-
-def tolerance(op_name, dtype):
-    """all_gather is pure data movement → effectively exact. all_reduce sums
-    world_size values, and bf16's 7-bit mantissa (ULP ~8x fp16's) makes tree-vs-
-    sequential accumulation diverge by a few ULPs — benign, but it needs a
-    dtype-aware absolute tolerance so a *correct* bf16 reduce isn't flagged. A
-    real reduction bug produces garbage orders of magnitude beyond this."""
-    if op_name == "all_gather":
-        return 1e-3
-    return 0.1 if dtype == torch.bfloat16 else 0.01
-
-
 def _judge(op_name, dtype, all_inputs, got):
     """Every replay against its OWN reference. Pure. Returns (ok, worst_diff, worst_at, atol).
 
@@ -346,10 +374,11 @@ def _judge(op_name, dtype, all_inputs, got):
     `worst_at` is the diagnostic that let the identical-input mode be deleted -- diverging at replay
     0 means capture is wrong, at replay 1+ means a stale read between replays.
     """
-    atol, rtol = tolerance(op_name, dtype), 0.01
+    op = _OP[op_name]
+    atol, rtol = op.atol(dtype), 0.01
     ok, worst_diff, worst_at = True, 0.0, -1
     for k, mine in enumerate(got):
-        ref = reference(op_name, [all_inputs[r][k] for r in range(len(all_inputs))]).to(torch.float32)
+        ref = op.reference([all_inputs[r][k] for r in range(len(all_inputs))]).to(torch.float32)
         cur = mine.to(torch.float32)
         d = (cur - ref).abs().max().item()
         if d > worst_diff:
@@ -441,24 +470,9 @@ def rendezvous() -> Tuple[str, int]:
     return "127.0.0.1", get_open_port()
 
 
-# The admission parameters CustomAllreduce uses, RECORDED here. That is the path these backends
-# replace, so it is the envelope they have to match, and writing the numbers down is what makes the
-# match reviewable. aiter must not IMPORT vllm to get them -- vllm depends on aiter, not the reverse.
-#
-# From vllm/distributed/device_communicators/custom_all_reduce.py, `should_custom_ar`:
-#     inp_size % 16 == 0, is_weak_contiguous(inp), and inp_size < self.max_size (default 8 MiB).
-#
-# NOT from `aiter/dist/device_communicators/custom_all_reduce.py`, which is a modified fork: it
-# hardcodes `fully_connected`, splits the bound with an `8192*8192` constant, and adds a
-# `should_custom_ag` upstream does not have. Reading it as the reference produced two wrong bounds.
-BASELINE_MAX_SIZE = 8 * 1024 * 1024      # CustomAllreduce's default max_size
-BASELINE_ALIGNMENT = 16                  # "input byte size to be multiples of 16"
-
-
 def baseline_admits(nbytes: int) -> bool:
     """`should_custom_ar` for a contiguous input on a fully-connected box, from the numbers above."""
     return nbytes % BASELINE_ALIGNMENT == 0 and nbytes < BASELINE_MAX_SIZE
-
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 def test_admission_matches_the_baseline(world_size: int) -> None:
@@ -520,7 +534,7 @@ def test_collective_matches_the_reference(backend: str, op: str, dtype: str,
     # card, which fits an OWNED box and nothing less. Reported as a skip rather than left to OOM
     # twenty minutes in, because the footprint is arithmetic and can be known before spawning.
     sched = SCHEDULES[mode]
-    fan = world if op == "all_gather" else 1
+    fan = world if _OP[op].fans_out else 1
     per_slot = torch.empty(shape, dtype=torch_dtype).numel() * torch.empty(0, dtype=torch_dtype).element_size()
     need = sched.slots * per_slot * (world + fan)
     budget = int(torch.cuda.get_device_properties(0).total_memory * MEMORY_BUDGET)
