@@ -8,7 +8,8 @@ gen_inputs -> run_collective -> expected_outputs -> compare.
 
 The modes localise a failure rather than covering different ground: `eager` asks whether the
 collective is right at all, `graph` whether capture/replay preserves that across many replays with
-fresh input, `vllm` whether the real pattern works (one collective per layer in one capture).
+fresh input, `vllm` whether the real pattern works: a collective per layer, captured into more than
+one graph under a single registration, replayed round-robin, with an eager fallback in the middle.
 """
 
 import logging
@@ -93,9 +94,11 @@ def _expected(op_name: str, inputs: Sequence[torch.Tensor]) -> torch.Tensor:
     return torch.cat(inputs, dim=-1)
 
 
-# The RELATIVE half of the tolerance, shared by every case. Named because the printed line quotes
-# it: a bf16 reduce of eight values lands ~0.125 off a sequential fp32 reference, so `worst|diff|`
-# routinely exceeds `atol` alone and a line that showed only `atol` read as a failure that passed.
+# The RELATIVE half of the tolerance. One value for every case, where `atol` is per (op, dtype) --
+# but PASSED alongside it rather than reached for inside `compare`, so the whole tolerance arrives
+# the same way and the line can report what was actually applied. It has to be reported: a bf16
+# reduce of eight values lands ~0.125 off a sequential fp32 reference, so `worst|diff|` routinely
+# exceeds `atol` on its own and a line quoting only `atol` reads as a failure that passed.
 RTOL = 0.01
 
 
@@ -135,8 +138,13 @@ DTYPES = ("fp16", "bf16")
 # where the communicator starts declining and vLLM falls back; 4088 is deliberately not a power of two.
 SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
 
-# `vllm` is a superset of `graph`: same replay depth, plus one collective per layer in one capture.
+# `vllm` is a superset of `graph`: same replay depth, plus one collective per layer in one capture,
+# captured into more than one graph and replayed round-robin.
 VLLM_LAYERS = 8
+# vLLM captures a graph per batch size -- dozens -- inside ONE capture context, then replays whichever
+# one the incoming batch matches. TWO is the smallest number that makes those two facts true: a
+# registration covering more than one graph, and a replay that is not always the last graph captured.
+VLLM_GRAPHS = 2
 
 # The share of one card a single case may need for its inputs and snapshots. Multi-GPU runs OWN the
 # machine (coordinated beforehand), so a case may take most of a card -- but not so much that the
@@ -147,8 +155,14 @@ MEMORY_BUDGET = 0.70
 @dataclass(frozen=True)
 class Schedule:
     buffers: int        # distinct input buffers the collective is called on, per replay
+    graphs: int         # graphs the body is captured into, replayed round-robin; 0 runs it eagerly
     replays: int        # how many times the body runs
-    captured: bool      # is the body recorded into a cudagraph and replayed
+
+    @property
+    def captured(self) -> bool:
+        """Eager is `graphs=0`. There is no third state, so ONE field says which mode this is and a
+        `captured` flag that could disagree with `graphs` cannot exist."""
+        return self.graphs > 0
 
     @property
     def slots(self) -> int:
@@ -157,9 +171,9 @@ class Schedule:
 
 
 SCHEDULES = {
-    "eager": Schedule(buffers=1, replays=1, captured=False),
-    "graph": Schedule(buffers=1, replays=GRAPH_REPLAYS, captured=True),
-    "vllm": Schedule(buffers=VLLM_LAYERS, replays=GRAPH_REPLAYS, captured=True),
+    "eager": Schedule(buffers=1, graphs=0, replays=1),
+    "graph": Schedule(buffers=1, graphs=1, replays=GRAPH_REPLAYS),
+    "vllm": Schedule(buffers=VLLM_LAYERS, graphs=VLLM_GRAPHS, replays=GRAPH_REPLAYS),
 }
 MODES = tuple(SCHEDULES)
 
@@ -175,19 +189,32 @@ class Measurement:
     worst_diff: float
     worst_slot: int             # slot index of the worst divergence; -1 if exact
     atol: float
+    rtol: float                 # STORED, not read from the constant: the line reports what was applied
 
     def worse_of(self, other: "Measurement") -> "Measurement":
-        """The worse of two, so a sweep folds without unpacking. Passing requires BOTH to pass."""
-        return self if self.worst_diff >= other.worst_diff and not other.within_tolerance \
-            else Measurement(
-                within_tolerance=self.within_tolerance and other.within_tolerance,
-                worst_diff=max(self.worst_diff, other.worst_diff),
-                worst_slot=other.worst_slot if other.worst_diff > self.worst_diff else self.worst_slot,
-                atol=other.atol or self.atol)
+        """The worse of two, so a sweep folds without unpacking.
+
+        Passing requires BOTH to pass -- that is the whole verdict, and it is an AND with no
+        shortcut: an earlier form returned one side outright when its divergence was larger, which
+        threw away the OTHER side's failure. The NUMBERS come from a failing side if either failed,
+        and otherwise from the larger divergence: `atol` is per (op, dtype), so the bigger
+        `worst_diff` is not always the one that broke its tolerance, and printing a passing cell's
+        numbers beside a failing verdict names the wrong cell.
+        """
+        if self.within_tolerance != other.within_tolerance:
+            keep = other if self.within_tolerance else self
+        else:
+            keep = self if self.worst_diff >= other.worst_diff else other
+        return Measurement(within_tolerance=self.within_tolerance and other.within_tolerance,
+                           worst_diff=keep.worst_diff, worst_slot=keep.worst_slot,
+                           atol=keep.atol, rtol=keep.rtol)
 
     def __str__(self) -> str:
+        # The VERDICT, not just the numbers: `worst|diff|` alone is not readable against a two-part
+        # tolerance, so a line without it looks the same whether the cell passed or failed.
         at = f" @slot {self.worst_slot}" if self.worst_slot >= 0 else ""
-        return f"worst|diff|={self.worst_diff:g} atol={self.atol:g} rtol={RTOL:g}{at}"
+        ok = "ok  " if self.within_tolerance else "FAIL"
+        return f"{ok} worst|diff|={self.worst_diff:g} atol={self.atol:g} rtol={self.rtol:g}{at}"
 
 
 def _build_communicator(backend: str, cpu_group: ProcessGroup, device_group: ProcessGroup,
@@ -260,10 +287,10 @@ def precheck(comm: Communicator, op_name: str, shape: Tuple[int, ...], dtype: to
     A bare `-> Optional[str]` cannot say that -- a reader has to open the docstring to learn the string
     is an error rather than a result. Python has no void, so `None` fills the value slot.
 
-    A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, plus a
-    pool each for inputs and expectations -- so it duplicates their knowledge and can go stale.
-    Under-counting OOMs, over-counting skips a cell that would have fit; counting two of the three terms
-    is how it once passed a cell that then OOM'd.
+    A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, a pool
+    each for inputs and expectations, and every graph's live outputs -- so it duplicates their knowledge
+    and can go stale. Under-counting OOMs, over-counting skips a cell that would have fit; counting two
+    of the terms is how it once passed a cell that then OOM'd.
     """
     one = torch.empty(shape, dtype=dtype)
     if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
@@ -271,7 +298,10 @@ def precheck(comm: Communicator, op_name: str, shape: Tuple[int, ...], dtype: to
     per = one.numel() * one.element_size()
     fan = _expected(op_name, [one] * world).numel() // one.numel()
     pool = min(sched.slots, INPUT_POOL)
-    need = sched.slots * per * fan + pool * per * world + pool * per * fan
+    # A snapshot per slot, a pool each for inputs and expectations, and the live outputs of every
+    # graph -- `or 1` because eager has no graph but still holds one body's worth.
+    live = sched.buffers * (sched.graphs or 1)
+    need = sched.slots * per * fan + pool * per * world + pool * per * fan + live * per * fan
     if need > budget:
         return None, f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
     return None, None
@@ -281,7 +311,7 @@ def run_collective(comm: Communicator, op_name: str, mine: Sequence[torch.Tensor
                    sched: Schedule) -> List[torch.Tensor]:
     """One output per SLOT: slot j is replay `j // buffers` on buffer `j % buffers`.
 
-    The graph is a LOCAL and dies here; a live one makes `destroy_process_group` block forever. The
+    The graphs are LOCALS and die here; a live one makes `destroy_process_group` block forever. The
     warmup runs EAGER on the same communicator, registering the staging buffer. Only a snapshot sits
     between replays, so they stay back-to-back -- an elided end barrier needs that to race.
     """
@@ -307,17 +337,36 @@ def run_collective(comm: Communicator, op_name: str, mine: Sequence[torch.Tensor
     for _ in range(3):          # eager warmup: first-call allocations, and the staging registration
         body()
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with comm.capture(), torch.cuda.graph(graph):
-        outs = body()
-    snaps = [torch.empty((sched.replays, *o.shape), dtype=o.dtype, device=o.device) for o in outs]
+    # ONE capture context over EVERY graph, the way vLLM's covers every batch size it captures: the
+    # deferred registration then happens once for all of them, which is the path a real startup takes
+    # and the only place a registration wider than a single graph is exercised. The graphs are NOT
+    # given a shared pool -- the inputs the communicator sees are the statics, allocated before any
+    # capture, so sharing would change torch's bookkeeping and nothing the communicator observes.
+    graphs = [torch.cuda.CUDAGraph() for _ in range(sched.graphs)]
+    outs = []
+    with comm.capture():
+        for g in graphs:
+            with torch.cuda.graph(g):
+                outs.append(body())
+    # Every graph records the same body, so one snapshot set indexed by replay covers all of them.
+    snaps = [torch.empty((sched.replays, *o.shape), dtype=o.dtype, device=o.device) for o in outs[0]]
     for k in range(sched.replays):
         feed(k)
-        graph.replay()
-        for m, o in enumerate(outs):
+        # ROUND-ROBIN, not one graph every time: vLLM replays whichever graph the incoming batch
+        # matches, and alternating is what shows each graph got its OWN peer pointers rather than
+        # reading the set the last capture happened to leave behind.
+        which = k % sched.graphs
+        graphs[which].replay()
+        for m, o in enumerate(outs[which]):
             snaps[m][k].copy_(o)
+        if sched.graphs > 1 and k == sched.replays // 2:
+            # An EAGER collective mid-replay, result DISCARDED. vLLM falls back to eager for a batch
+            # no graph matches, on this same communicator and after its graph buffers are registered.
+            # What is checked is not this result but that every replay after it is still right -- so
+            # it belongs to the mode that models vLLM, and `graph` stays the clean isolator.
+            body()
     torch.cuda.synchronize()
-    return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs))]
+    return [snaps[m][k] for k in range(sched.replays) for m in range(len(outs[0]))]
 
 
 def expected_outputs(op_name: str, inputs: Sequence[Sequence[torch.Tensor]],
@@ -334,7 +383,7 @@ def expected_outputs(op_name: str, inputs: Sequence[Sequence[torch.Tensor]],
 
 
 def compare(got: Sequence[torch.Tensor], expected: Sequence[torch.Tensor],
-            atol: float) -> Measurement:
+            atol: float, rtol: float) -> Measurement:
     """Every slot against its OWN expectation.
 
     allclose (atol + rtol*|ref|), not absolute-only: a correct large-magnitude fp16 reduce exceeds a
@@ -347,9 +396,10 @@ def compare(got: Sequence[torch.Tensor], expected: Sequence[torch.Tensor],
         d = (a - b).abs().max().item()
         if d > worst_diff:
             worst_diff, worst_slot = d, j
-        if not torch.allclose(a, b, atol=atol, rtol=RTOL):
+        if not torch.allclose(a, b, atol=atol, rtol=rtol):
             ok = False
-    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_slot=worst_slot, atol=atol)
+    return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_slot=worst_slot,
+                       atol=atol, rtol=rtol)
 
 
 def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch.device,
@@ -362,7 +412,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
     correct behaviour. Each cell is scoped so its tensors die with the frame.
     """
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
-    worst = Measurement(within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0)
+    worst = Measurement(within_tolerance=True, worst_diff=0.0, worst_slot=-1, atol=0.0, rtol=0.0)
     # `with`, so release is in the SYNTAX: `close()` runs at block exit whatever happens inside, where
     # `del` only releases if nothing else holds a reference -- and a failing cell's traceback holds the
     # frames that hold the communicator, so `del` fails exactly when it matters.
@@ -382,7 +432,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
                 inputs = gen_inputs(shape, dtype, world, sched.slots, device)
                 got = run_collective(comm, op_name, inputs[rank], sched)
                 expected = expected_outputs(op_name, inputs, sched.slots)
-                return compare(got, expected, atol), None
+                return compare(got, expected, atol, RTOL), None
 
             # Same check, same track: `err is not None` means an error, and `got` is only read once
             # we know there was none.
@@ -513,5 +563,5 @@ def test_communicator(backend: str, mode: str, world: int, rendezvous: Tuple[str
     addr, port = rendezvous
     print(f"\n  {backend} / {mode}", flush=True)
     got = run_communicator(backend, mode, world, addr, port)
-    print(f"      => worst|diff|={got.worst_diff:g} atol={got.atol:g} rtol={RTOL:g}", flush=True)
+    print(f"      => {got}", flush=True)
     assert got.within_tolerance, f"{backend}/{mode}: outside tolerance (cells above)"
