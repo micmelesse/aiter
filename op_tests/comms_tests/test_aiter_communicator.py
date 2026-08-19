@@ -22,6 +22,7 @@ the dropped/stale all_gather race the identical-input loop misses.
 
 import logging
 from functools import partial
+from itertools import product
 from dataclasses import dataclass
 import multiprocessing as mp
 import time
@@ -86,6 +87,12 @@ OPS = ("all_reduce", "all_gather")
 
 
 
+
+
+def _say(rank, line):
+    """Print from rank 0 only: eight ranks saying the same thing is one fact, eight times."""
+    if rank == 0:
+        print(line, flush=True)
 
 
 def _expected(op_name, inputs):
@@ -343,68 +350,75 @@ def _judge(op_name, dtype, all_inputs, got):
     return ok, worst_diff, worst_at, atol
 
 
-def exercise(comm, sched: Schedule, world: int, rank: int, device) -> tuple:
-    """Put a communicator through its whole API and return the worst verdict. THE definition of
-    "does this communicator work".
+def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
+             cpu_group, group) -> tuple:
+    """CREATE a communicator, put it through its whole API, TEAR IT DOWN. Returns the worst verdict.
+    THE definition of "does this communicator work".
 
-    ONE instance does every collective at every dtype and shape, which is both the question worth
-    asking and what vLLM actually does -- it drives all_reduce and all_gather through a single
-    communicator for the life of the server, so testing them on separate instances tests something
-    easier than production.
+    It owns the whole lifetime because construction and teardown are two of the ways a communicator
+    fails, not setup around the part that counts: building one is a COLLECTIVE (hip exchanges IPC
+    handles, so a non-uniform failure hangs rather than errors), and teardown is where a live captured
+    graph makes `destroy_process_group` block forever. Owning both also puts the ORDER beyond reach --
+    the communicator is gone before the caller destroys the group, by nesting rather than by comment.
 
-    A cell the communicator DECLINES, or one too large for the memory budget, is reported and skipped
-    rather than failed: declining is correct behaviour, and the footprint is arithmetic.
+    ONE instance does every cell, which is both the question worth asking and what vLLM does: it drives
+    all_reduce and all_gather through a single communicator for the life of the server, so exercising
+    them on separate instances tests something easier than production.
 
-    Each cell runs in a nested scope so its tensors die with the frame -- at `vllm`'s 1600 slots one
-    cell can hold most of a card, and the next cell needs that memory back.
+    A cell the communicator DECLINES, or one past the memory budget, is reported and skipped rather
+    than failed: declining is correct behaviour, and the footprint is arithmetic. Each cell runs in a
+    nested scope so its tensors die with the frame -- at `vllm`'s 1600 slots one cell can hold most of
+    a card, and the next needs that memory back.
     """
-    worst = (True, 0.0, -1, 0.0)
+    comm = _build_communicator(backend, cpu_group, group, device)
     budget = int(torch.cuda.get_device_properties(device).total_memory * MEMORY_BUDGET)
-
-    for op_name in OPS:
-        gate = getattr(comm, f"should_{op_name.replace('_', '')}")
-        for dtype_name in DTYPES:
+    worst = (True, 0.0, -1, 0.0)
+    try:
+        for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
             dtype = dtypes.d_dtypes[dtype_name]
-            for shape in SHAPES:
-                one = torch.empty(shape, dtype=dtype)
-                if not gate(one):
-                    if rank == 0:
-                        print(f"      - {op_name} {dtype_name} {shape}: declined by the communicator",
-                              flush=True)
-                    continue
-                # Every rank materialises every rank's input for every slot, plus one snapshot each,
-                # and a gather's output is world_size x its input.
-                fan = _expected(op_name, [one] * world).numel() // one.numel()
-                need = sched.slots * one.numel() * one.element_size() * (world + fan)
-                if need > budget:
-                    if rank == 0:
-                        print(f"      - {op_name} {dtype_name} {shape}: needs {need / 2**30:.0f}G, "
-                              f"budget {budget / 2**30:.0f}G", flush=True)
-                    continue
+            one = torch.empty(shape, dtype=dtype)
+            where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
 
-                def cell():
-                    all_inputs = [[_replay_input(r, j, shape, dtype).to(device)
-                                   for j in range(sched.slots)] for r in range(world)]
-                    mine = all_inputs[rank]
-                    statics = [mine[m].clone() for m in range(sched.buffers)]
-                    # `partial` on the API itself. No wrapper re-checks admission: the communicator
-                    # enforces its own envelope and raises, so a check here would restate that.
-                    ops = [partial(getattr(comm, op_name), st) for st in statics]
-                    return _judge(op_name, dtype, all_inputs, _run(comm, ops, statics, mine, sched))
+            if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
+                _say(rank, f"      - {where} declined by the communicator")
+                continue
+            # Every rank materialises every rank's input for every slot, plus one snapshot each, and a
+            # gather's output is world_size x its input. Derived from `_expected` so the estimate
+            # cannot disagree with what the cell actually allocates.
+            fan = _expected(op_name, [one] * world).numel() // one.numel()
+            need = sched.slots * one.numel() * one.element_size() * (world + fan)
+            if need > budget:
+                _say(rank, f"      - {where} needs {need / 2**30:.0f}G, "
+                           f"budget {budget / 2**30:.0f}G")
+                continue
 
-                v = cell()
-                if rank == 0:
-                    print(f"      {op_name:11} {dtype_name:5} {str(shape):12} "
-                          f"worst|diff|={v[1]:g} atol={v[3]:g}"
-                          + (f" @replay {v[2]}" if v[2] >= 0 else ""), flush=True)
-                worst = (worst[0] and v[0], max(worst[1], v[1]),
-                         v[2] if v[1] > worst[1] else worst[2], v[3])
-                torch.cuda.empty_cache()
-    return worst
+            def cell():
+                all_inputs = [[_replay_input(r, j, shape, dtype).to(device)
+                               for j in range(sched.slots)] for r in range(world)]
+                mine = all_inputs[rank]
+                statics = [mine[m].clone() for m in range(sched.buffers)]
+                # `partial` on the API itself. No wrapper re-checks admission: the communicator
+                # enforces its own envelope and raises, so a check here would restate that.
+                ops = [partial(getattr(comm, op_name), st) for st in statics]
+                return _judge(op_name, dtype, all_inputs, _run(comm, ops, statics, mine, sched))
+
+            ok, diff, at, atol = cell()
+            _say(rank, f"      {where} worst|diff|={diff:g} atol={atol:g}"
+                       + (f" @replay {at}" if at >= 0 else ""))
+            worst = (worst[0] and ok, max(worst[1], diff),
+                     at if diff > worst[1] else worst[2], atol)
+            torch.cuda.empty_cache()
+        return worst
+    finally:
+        # FINALLY, so a cell that raises still frees the communicator: anything holding graph-pool
+        # memory has to go before the caller tears the process group down.
+        del comm
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def run_rank(rank, world, pp, backend, mode, init_method):
-    """ONE per-rank worker: bring the group up, build the communicator, exercise it, tear down.
+    """ONE per-rank worker. It owns the PROCESS GROUP; the communicator's life is `exercise`'s.
 
     Every rank rebuilds every rank's input from a seed, so it judges its own replays and only scalars
     cross the process boundary.
@@ -417,14 +431,10 @@ def run_rank(rank, world, pp, backend, mode, init_method):
     cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)     # force comm init before we measure
     torch.cuda.synchronize()
-    comm = _build_communicator(backend, cpu_group, group, device)
+    # The communicator's whole life is `exercise`'s; this function owns only the PROCESS GROUP it
+    # lives in, and tears that down after.
+    verdict = exercise(backend, SCHEDULES[mode], world, rank, device, cpu_group, group)
 
-    verdict = exercise(comm, SCHEDULES[mode], world, rank, device)
-
-    # The ONE teardown. The graph is already freed by `_run` having returned, and each cell's tensors
-    # by its frame -- a live captured graph makes `destroy_process_group` block forever.
-    del comm
-    torch.cuda.synchronize()
     if dist.is_initialized():
         destroy_model_parallel()
         destroy_distributed_environment()
