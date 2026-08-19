@@ -247,11 +247,12 @@ def _one_input(rank: int, k: int, shape: Tuple[int, ...], dtype: torch.dtype) ->
 
 
 def precheck(comm: Communicator, op_name: str, shape: Tuple[int, ...], dtype: torch.dtype,
-             world: int, sched: Schedule, budget: int) -> Optional[str]:
-    """Why this cell will not run, or None if it will. Neither reason is a failure.
+             world: int, sched: Schedule, budget: int) -> Tuple[None, Optional[str]]:
+    """`(None, why)` if this cell will not run, `(None, None)` if it will. Neither reason is a failure.
 
-    Void + error, since there is nothing to return but the reason -- Go's `func (f *File) Close() error`.
-    The pair is for a function with a VALUE; the check is always on `err`, never on a bool.
+    ALWAYS the tuple, even with no value to return: the pair IS the signal that a function can fail.
+    A bare `-> Optional[str]` cannot say that -- a reader has to open the docstring to learn the string
+    is an error rather than a result. Python has no void, so `None` fills the value slot.
 
     A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, plus a
     pool each for inputs and expectations -- so it duplicates their knowledge and can go stale.
@@ -260,14 +261,14 @@ def precheck(comm: Communicator, op_name: str, shape: Tuple[int, ...], dtype: to
     """
     one = torch.empty(shape, dtype=dtype)
     if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
-        return "declined by the communicator"
+        return None, "declined by the communicator"
     per = one.numel() * one.element_size()
     fan = _expected(op_name, [one] * world).numel() // one.numel()
     pool = min(sched.slots, INPUT_POOL)
     need = sched.slots * per * fan + pool * per * world + pool * per * fan
     if need > budget:
-        return f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
-    return None
+        return None, f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
+    return None, None
 
 
 def run_collective(comm: Communicator, op_name: str, mine: Sequence[torch.Tensor],
@@ -366,15 +367,21 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device: torch
             atol = _atol(op_name, dtype)
 
             def cell() -> Tuple[Optional[Measurement], Optional[str]]:
-                if err := precheck(comm, op_name, shape, dtype, world, sched, budget):
+                # THE ERROR TRACK is the second element, and it is the ONLY thing we test: `err is
+                # not None` means we have an error. Never the value -- when `err` is set the value slot
+                # is not to be read, and here there is no value at all.
+                _, err = precheck(comm, op_name, shape, dtype, world, sched, budget)
+                if err is not None:
                     return None, err
                 inputs = gen_inputs(shape, dtype, world, sched.slots, device)
                 got = run_collective(comm, op_name, inputs[rank], sched)
                 expected = expected_outputs(op_name, inputs, sched.slots)
                 return compare(got, expected, atol), None
 
+            # Same check, same track: `err is not None` means an error, and `got` is only read once
+            # we know there was none.
             got, err = cell()
-            if err:
+            if err is not None:
                 _say(rank, f"      - {where} {err}")
                 continue
             _say(rank, f"      {where} {got}")
