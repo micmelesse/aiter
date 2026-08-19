@@ -128,7 +128,11 @@ class HipComms:
         device: torch.device,
         *,
         scratch_bytes: int = 8 << 20,
-        max_buffers: int = 512,
+        # One slot per CAPTURED LAUNCH over this object's life, not per distinct address:
+        # a capture always records (see `slot_for`). vLLM captures one graph per batch
+        # size and a collective per layer, so the count is capture_sizes x layers --
+        # thousands. 131072 slots is 8MB, the size vLLM gives the same array.
+        max_buffers: int = 131072,
         max_size: int = 8 << 20,
     ) -> None:
         mod = load()
@@ -212,11 +216,21 @@ class HipComms:
             self.flush_pending()
 
     def flush_pending(self) -> None:
-        """Register whatever the capture deferred. A no-op when nothing is pending."""
+        """Register whatever the capture deferred.
+
+        ALWAYS one collective, even with nothing pending -- a rank that returned early here
+        would leave the others waiting in the gather. Nothing is registered when nothing is
+        pending; the exchange still has to happen."""
         pending: Sequence[int] = self.comms.pending_graph_buffers()
-        # Collective: every rank must agree on the count, or the exchange below deadlocks
-        # with a confusing message instead of this one.
-        counts = _all_gather_object(self.cpu_group, len(pending))
+        # ONE collective for ALL of them, not one each. A capture records a buffer per
+        # collective in the graph -- a layer each, in vLLM -- so per-buffer exchanges are how
+        # a graph-heavy startup becomes thousands of round trips.
+        mine = [self.mod.ipc_handle_and_offset(p) for p in pending]
+        gathered: List[List[Tuple[bytes, int]]] = _all_gather_object(self.cpu_group, mine)
+        # Every rank must agree on the count. The same gather that carries the handles proves
+        # it, and it has to be proven: the transpose below reads slot `i` from every rank, so
+        # a short list there is a peer set silently missing a rank.
+        counts = [len(g) for g in gathered]
         if len(set(counts)) != 1:
             raise RuntimeError(
                 f"hip_comms: ranks captured different numbers of buffers ({counts}); "
@@ -224,9 +238,9 @@ class HipComms:
             )
         if not pending:
             return
-        per_buffer = [self._exchange(p) for p in pending]
         self.comms.register_graph_buffers(
-            handles=[h for h, _ in per_buffer], offsets=[o for _, o in per_buffer]
+            handles=[[g[i][0] for g in gathered] for i in range(len(pending))],
+            offsets=[[g[i][1] for g in gathered] for i in range(len(pending))],
         )
 
     def _as_input(self, inp: torch.Tensor) -> torch.Tensor:

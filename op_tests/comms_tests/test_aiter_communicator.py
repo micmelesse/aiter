@@ -93,6 +93,12 @@ def _expected(op_name: str, inputs: Sequence[torch.Tensor]) -> torch.Tensor:
     return torch.cat(inputs, dim=-1)
 
 
+# The RELATIVE half of the tolerance, shared by every case. Named because the printed line quotes
+# it: a bf16 reduce of eight values lands ~0.125 off a sequential fp32 reference, so `worst|diff|`
+# routinely exceeds `atol` alone and a line that showed only `atol` read as a failure that passed.
+RTOL = 0.01
+
+
 def _atol(op_name: str, dtype: torch.dtype) -> float:
     """all_gather is data movement, so effectively exact. all_reduce sums world_size values, and
     bf16's 7-bit mantissa (ULP ~8x fp16's) makes tree-vs-sequential accumulation diverge by a few
@@ -181,7 +187,7 @@ class Measurement:
 
     def __str__(self) -> str:
         at = f" @slot {self.worst_slot}" if self.worst_slot >= 0 else ""
-        return f"worst|diff|={self.worst_diff:g} atol={self.atol:g}{at}"
+        return f"worst|diff|={self.worst_diff:g} atol={self.atol:g} rtol={RTOL:g}{at}"
 
 
 def _build_communicator(backend: str, cpu_group: ProcessGroup, device_group: ProcessGroup,
@@ -341,7 +347,7 @@ def compare(got: Sequence[torch.Tensor], expected: Sequence[torch.Tensor],
         d = (a - b).abs().max().item()
         if d > worst_diff:
             worst_diff, worst_slot = d, j
-        if not torch.allclose(a, b, atol=atol, rtol=0.01):
+        if not torch.allclose(a, b, atol=atol, rtol=RTOL):
             ok = False
     return Measurement(within_tolerance=ok, worst_diff=worst_diff, worst_slot=worst_slot, atol=atol)
 
@@ -507,5 +513,5 @@ def test_communicator(backend: str, mode: str, world: int, rendezvous: Tuple[str
     addr, port = rendezvous
     print(f"\n  {backend} / {mode}", flush=True)
     got = run_communicator(backend, mode, world, addr, port)
-    print(f"      => worst|diff|={got.worst_diff:g} atol={got.atol:g}", flush=True)
+    print(f"      => worst|diff|={got.worst_diff:g} atol={got.atol:g} rtol={RTOL:g}", flush=True)
     assert got.within_tolerance, f"{backend}/{mode}: outside tolerance (cells above)"

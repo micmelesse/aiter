@@ -251,7 +251,7 @@ class Comms {
   }
 
   ~Comms() {
-    for (void* base : opened_bases_) hipIpcCloseMemHandle(base);
+    for (const auto& kv : opened_) hipIpcCloseMemHandle(kv.second);
   }
 
   // A buffer whose address is known ahead of time. The eager path.
@@ -279,11 +279,16 @@ class Comms {
       throw std::runtime_error("hip_comms: got handles for " +
                                std::to_string(handles.size()) + " buffers, " +
                                std::to_string(pending_.size()) + " are pending");
+    // The slots are filled in; nothing goes into `registered_`. That map means "an address
+    // this object keeps alive", and a captured buffer is the opposite -- it dies with its
+    // graph. Nothing needs it there either: the slot pointer is baked into the launch the
+    // capture recorded, so a replay never looks the address up. `registered_` therefore holds
+    // exactly what `register_buffer` was called for, which is what Python's `_registered`
+    // tracks.
     for (size_t i = 0; i < pending_.size(); ++i) {
       auto ptrs = open_peers(handles[i], offsets[i],
                              reinterpret_cast<uintptr_t>(pending_[i]));
       write_slot(pending_slots_[i], ptrs);
-      registered_[pending_[i]] = pending_slots_[i];
     }
     pending_.clear();
     pending_slots_.clear();
@@ -341,11 +346,18 @@ class Comms {
         out[i] = reinterpret_cast<void*>(self);
         continue;
       }
-      void* base = nullptr;
-      auto h     = handle_from(handles[i]);
-      HIP_CHECK(hipIpcOpenMemHandle(&base, h, hipIpcMemLazyEnablePeerAccess));
-      opened_bases_.push_back(base);
-      out[i] = static_cast<char*>(base) + offsets[i];
+      // Once per distinct handle. A capture-heavy run exchanges the same peer BASES over
+      // and over -- one per graph, per rank -- and hipIpcOpenMemHandle on a handle this
+      // process already mapped is not a second mapping to close later. vLLM's
+      // CustomAllreduce keeps the same cache, keyed the same way.
+      auto it = opened_.find(handles[i]);
+      if (it == opened_.end()) {
+        void* base = nullptr;
+        HIP_CHECK(hipIpcOpenMemHandle(&base, handle_from(handles[i]),
+                                      hipIpcMemLazyEnablePeerAccess));
+        it = opened_.emplace(handles[i], base).first;
+      }
+      out[i] = static_cast<char*>(it->second) + offsets[i];
     }
     return out;
   }
@@ -373,8 +385,12 @@ class Comms {
     hipStreamCaptureStatus status;
     HIP_CHECK(hipStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &status));
     if (status == hipStreamCaptureStatusActive) {
-      auto it = registered_.find(input);
-      if (it != registered_.end()) return it->second;
+      // A fresh slot ALWAYS, even for an address `registered_` already knows. An address is
+      // only as durable as the allocation under it: a graph's buffers are freed when the
+      // graph dies and the allocator hands the same address back for the next one. Skipping
+      // the record here would make the recorded COUNT depend on that luck -- and what
+      // follows a capture is a COLLECTIVE exchange, so ranks that skip differently do not
+      // merely disagree, they exchange the wrong number of handles.
       PeerPtrs* slot = next_slot();
       pending_.push_back(input);
       pending_slots_.push_back(slot);
@@ -442,7 +458,7 @@ class Comms {
   std::unordered_map<void*, PeerPtrs*> registered_;
   std::vector<void*> pending_;
   std::vector<PeerPtrs*> pending_slots_;
-  std::vector<void*> opened_bases_;
+  std::unordered_map<std::string, void*> opened_;
 };
 
 }  // namespace hip_comms
