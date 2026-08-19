@@ -276,6 +276,33 @@ def _one_input(rank, k, shape, dtype):
     return torch.randn(shape, generator=g).to(dtype)
 
 
+def skip_reason(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: int):
+    """Why this cell will not be exercised, or None. The two reasons, and they are not failures.
+
+    DECLINED: the communicator says it does not take this input, which is correct behaviour -- vLLM
+    falls back. Asked through the API's own gate, so this cannot drift from what it would answer.
+
+    TOO BIG: it would not fit. The estimate mirrors what the three steps allocate -- `run_collective`
+    keeps one snapshot per slot (the only term scaling with slots), `gen_inputs` and
+    `expected_outputs` each keep a pool -- and a gather's output is world_size x its input, taken from
+    `_expected` so the fan-out cannot disagree with what is actually built.
+
+    It is a GUARD, not a contract: it duplicates what those three know, so under-counting OOMs and
+    over-counting skips a cell that would have fit. Both are visible, and counting only two of the
+    three terms is exactly how it once passed a cell that then OOM'd.
+    """
+    one = torch.empty(shape, dtype=dtype)
+    if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
+        return "declined by the communicator"
+    per = one.numel() * one.element_size()
+    fan = _expected(op_name, [one] * world).numel() // one.numel()
+    pool = min(sched.slots, INPUT_POOL)
+    need = sched.slots * per * fan + pool * per * world + pool * per * fan
+    if need > budget:
+        return f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
+    return None
+
+
 def run_collective(comm, op_name, mine, sched: Schedule):
     """One output per SLOT, in slot order. Slot j is replay `j // buffers` on buffer `j % buffers`.
 
@@ -369,27 +396,10 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
     with _build_communicator(backend, cpu_group, group, device) as comm:
         for op_name, dtype_name, shape in product(OPS, DTYPES, SHAPES):
             dtype = dtypes.d_dtypes[dtype_name]
-            one = torch.empty(shape, dtype=dtype)
             where = f"{op_name:11} {dtype_name:5} {str(shape):12}"
-
-            if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
-                _say(rank, f"      - {where} declined by the communicator")
+            if why := skip_reason(comm, op_name, shape, dtype, world, sched, budget):
+                _say(rank, f"      - {where} {why}")
                 continue
-            # Every rank materialises every rank's input for every slot, plus one snapshot each, and a
-            # gather's output is world_size x its input. Derived from `_expected` so the estimate
-            # cannot disagree with what the cell actually allocates.
-            fan = _expected(op_name, [one] * world).numel() // one.numel()
-            per = one.numel() * one.element_size()
-            pool = min(sched.slots, INPUT_POOL)
-            # All THREE things a cell holds. The snapshots are the only term that scales with slots;
-            # inputs and expectations are pooled. Counting only two of the three is how this guard
-            # passed a cell that then OOM'd.
-            need = sched.slots * per * fan + pool * per * world + pool * per * fan
-            if need > budget:
-                _say(rank, f"      - {where} needs {need / 2**30:.0f}G, "
-                           f"budget {budget / 2**30:.0f}G")
-                continue
-
             atol = _atol(op_name, dtype)
 
             def cell():
