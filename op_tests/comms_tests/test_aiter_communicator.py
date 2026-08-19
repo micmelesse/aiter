@@ -432,14 +432,27 @@ def run_rank(rank, world, pp, backend, mode, init_method):
     dist.all_reduce(torch.zeros(1).cuda(), group=group)     # force comm init before we measure
     torch.cuda.synchronize()
     # The communicator's whole life is `exercise`'s; this function owns only the PROCESS GROUP it
-    # lives in, and tears that down after.
-    verdict = exercise(backend, SCHEDULES[mode], world, rank, device, cpu_group, group)
-
-    if dist.is_initialized():
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        torch.cuda.empty_cache()
-    return verdict
+    # lives in. FINALLY, because plenty can go wrong in between and a rank that dies with its group
+    # still up leaves its peers waiting on a socket instead of seeing a clean disconnect -- which
+    # turns one rank's error into everyone's 600-second timeout.
+    try:
+        return exercise(backend, SCHEDULES[mode], world, rank, device, cpu_group, group)
+    except BaseException:
+        # Logged HERE, with the rank, before it crosses the process boundary: the pool surfaces one
+        # failure to the parent, and on eight ranks the one it picks is not always the informative one.
+        logger.exception("rank %d failed exercising %s/%s", rank, backend, mode)
+        raise
+    finally:
+        # Its OWN try, so a teardown that fails cannot replace the failure that got us here -- the
+        # diagnosis is worth more than the cleanup, and `destroy_process_group` is exactly the call
+        # that has hung on us before.
+        try:
+            if dist.is_initialized():
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception("rank %d: teardown failed after %s/%s", rank, backend, mode)
 
 
 def run_communicator(backend: str, mode: str, world: int, addr: str, port: int,
