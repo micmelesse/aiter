@@ -320,8 +320,15 @@ def run_collective(comm, op_name, mine, sched: Schedule):
 
 
 def expected_outputs(op_name, inputs, slots: int):
-    """What this rank should hold after each slot: the collective applied to every rank's input."""
-    return [_expected(op_name, [inputs[r][j] for r in range(len(inputs))]) for j in range(slots)]
+    """What this rank should hold after each slot: the collective applied to every rank's input.
+
+    POOLED like the inputs, and for the same reason -- only `INPUT_POOL` inputs are distinct, so only
+    that many answers are. Building one per slot would have cost as much as the snapshots (100 GiB at
+    `vllm`'s largest cell, on top of the snapshots' 100) and OOM'd inside the memory budget.
+    """
+    pool = min(slots, INPUT_POOL)
+    made = [_expected(op_name, [inputs[r][j] for r in range(len(inputs))]) for j in range(pool)]
+    return [made[j % pool] for j in range(slots)]
 
 
 def compare(got, expected, atol):
@@ -372,7 +379,12 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
             # gather's output is world_size x its input. Derived from `_expected` so the estimate
             # cannot disagree with what the cell actually allocates.
             fan = _expected(op_name, [one] * world).numel() // one.numel()
-            need = sched.slots * one.numel() * one.element_size() * (world + fan)
+            per = one.numel() * one.element_size()
+            pool = min(sched.slots, INPUT_POOL)
+            # All THREE things a cell holds. The snapshots are the only term that scales with slots;
+            # inputs and expectations are pooled. Counting only two of the three is how this guard
+            # passed a cell that then OOM'd.
+            need = sched.slots * per * fan + pool * per * world + pool * per * fan
             if need > budget:
                 _say(rank, f"      - {where} needs {need / 2**30:.0f}G, "
                            f"budget {budget / 2**30:.0f}G")
