@@ -229,7 +229,11 @@ def _one_input(rank, k, shape, dtype):
 
 
 def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: int):
-    """Will this cell run? `(True, None)`, or `(False, why)`. Neither reason is a failure.
+    """Why this cell will not run, or None if it will. Neither reason is a failure.
+
+    ONLY the error, no value: there is nothing to return besides the reason, and a `(bool, err)` pair
+    would carry the same fact twice -- `err is None` already IS the bool. Go's shape for the same case
+    (`func (f *File) Close() error`).
 
     A GUARD, not a contract: `need` mirrors what the three steps allocate -- a snapshot per slot, plus a
     pool each for inputs and expectations -- so it duplicates their knowledge and can go stale.
@@ -238,14 +242,14 @@ def precheck(comm, op_name, shape, dtype, world: int, sched: Schedule, budget: i
     """
     one = torch.empty(shape, dtype=dtype)
     if not getattr(comm, f"should_{op_name.replace('_', '')}")(one):
-        return False, "declined by the communicator"
+        return "declined by the communicator"
     per = one.numel() * one.element_size()
     fan = _expected(op_name, [one] * world).numel() // one.numel()
     pool = min(sched.slots, INPUT_POOL)
     need = sched.slots * per * fan + pool * per * world + pool * per * fan
     if need > budget:
-        return False, f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
-    return True, None
+        return f"needs {need / 2**30:.0f}G, budget {budget / 2**30:.0f}G"
+    return None
 
 
 def run_collective(comm, op_name, mine, sched: Schedule):
@@ -341,8 +345,7 @@ def exercise(backend: str, sched: Schedule, world: int, rank: int, device,
             atol = _atol(op_name, dtype)
 
             def cell():
-                ok, err = precheck(comm, op_name, shape, dtype, world, sched, budget)
-                if not ok:
+                if err := precheck(comm, op_name, shape, dtype, world, sched, budget):
                     return None, err
                 inputs = gen_inputs(shape, dtype, world, sched.slots, device)
                 got = run_collective(comm, op_name, inputs[rank], sched)
