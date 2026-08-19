@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import multiprocessing as mp
 import time
 from multiprocessing import Pool, set_start_method
-from typing import Callable, Tuple
+from typing import Tuple
 
 import pytest
 import torch
