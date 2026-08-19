@@ -115,7 +115,11 @@ MODES = ("eager", "graph")
 
 
 DTYPES = ("fp16", "bf16")
-SHAPES = ((4, 8192),)               # (128, 8192), (256, 8192) -- one size while the kernel lands
+# [tokens, 8192] is what vLLM hands a TP=8 all-reduce: hidden size 8192, token count varying with the
+# batch. 4088 straddles nothing but is deliberately NOT a power of two, and 512 is the token count at
+# which [tokens, 8192] bf16 reaches the 8 MiB admission bound -- so 511/512 sit either side of the
+# edge where the communicator starts declining and vLLM falls back.
+SHAPES = ((4, 8192), (128, 8192), (256, 8192), (511, 8192), (512, 8192), (4088, 8192))
 
 
 @dataclass(frozen=True)
@@ -346,6 +350,84 @@ def run_rank(rank, world, pp, case, init_method):
     return verdict
 
 
+VLLM_BUCKETS = ((4, 8192), (8, 8192), (16, 8192), (32, 8192), (64, 8192), (128, 8192))
+LIFETIME_ROUNDS = 4
+
+
+def run_rank_lifetime(rank, world, pp, backend, dtype, init_method):
+    """ONE communicator for its whole life: eager first, then a graph PER shape, then all of them
+    replayed in rounds. Returns the worst verdict over everything it did.
+
+    This is vLLM's pattern and nothing else here tests it. vLLM builds one communicator, runs prefill
+    EAGER through it, captures one graph per batch-size bucket (~50 of them), and then replays those
+    graphs for hours. Every other test in this file builds a fresh communicator, captures at most one
+    graph, and tears down -- so three things it depends on have never run: `flush_pending` called more
+    than once, a slot allocated per capture without being reused or leaked, and the eagerly-registered
+    staging buffer coexisting with capture-time registrations.
+    """
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    init_distributed_environment(world_size=world, rank=rank,
+                                 distributed_init_method=init_method)
+    ensure_model_parallel_initialized(world, pp)
+    cpu_group, group = get_tp_group().cpu_group, get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+    comm = _build_communicator(backend, cpu_group, group, device)
+
+    worst = (True, 0.0, -1, 0.0)
+    def fold(v):
+        nonlocal worst
+        worst = (worst[0] and v[0], max(worst[1], v[1]), v[2] if v[1] > worst[1] else worst[2], v[3])
+
+    # PREFILL first, eager, exactly as vLLM does before it captures anything. Scoped for the same
+    # reason as `_decode`: nothing device-side outlives the phase that made it.
+    def _prefill() -> None:
+        for shape in VLLM_BUCKETS[:2]:
+            alls = [[_replay_input(r, 0, shape, dtype).to(device)] for r in range(world)]
+            static = alls[rank][0].clone()
+            op = _make_op(comm, "all_reduce", static)
+            fold(_judge("all_reduce", dtype, alls, _run_eager(comm, op, alls[rank], static)))
+
+    _prefill()
+
+    # DECODE, in a NESTED FUNCTION so every graph, output and static buffer dies with its frame.
+    # Not tidiness: a live captured graph holds the communicator's work and `destroy_process_group`
+    # then blocks forever draining it. A loop variable is enough to keep one alive -- `del graphs`
+    # would not have, because `for g, ..., out in graphs` leaves those names bound afterwards.
+    def _decode() -> None:
+        graphs = []
+        for shape in VLLM_BUCKETS:
+            alls = [[_replay_input(r, k, shape, dtype).to(device) for k in range(LIFETIME_ROUNDS)]
+                    for r in range(world)]
+            static = alls[rank][0].clone()
+            op = _make_op(comm, "all_reduce", static)
+            for _ in range(3):
+                op()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with comm.capture(), torch.cuda.graph(g):
+                out = op()
+            graphs.append((g, alls, static, out))
+        # Replayed in ROUNDS, every graph each round: a slot a later capture overwrote shows up as an
+        # earlier graph going wrong, which one-graph-at-a-time could never see.
+        for rnd in range(LIFETIME_ROUNDS):
+            for g, alls, static, out in graphs:
+                static.copy_(alls[rank][rnd])
+                g.replay()
+                torch.cuda.synchronize()
+                fold(_judge("all_reduce", dtype, [[a[rnd]] for a in alls], [out.clone()]))
+
+    _decode()
+    del comm
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return worst
+
+
 def run_case(case: Case, world: int, addr: str, port: int, pp: int = 1) -> Measurement:
     """Run ONE case across `world` ranks: spawn, collect under a timeout, take the worst rank's.
 
@@ -450,9 +532,50 @@ def test_collective_matches_the_reference(backend: str, op: str, dtype: str,
     """
     if world < 2:
         pytest.skip("a collective needs at least two ranks")
+    torch_dtype = dtypes.d_dtypes[dtype]
+    # A shape the communicator DECLINES is correct behaviour -- vLLM falls back -- so it skips rather
+    # than fails. Asked before spawning, because admission is a pure function of the tensor and needs
+    # no ranks: [512, 8192] bf16 is exactly 8 MiB and the first size past the bound.
+    probe = object.__new__(TorchCommunicator)
+    probe.disabled, probe.world_size, probe.max_size = False, world, BASELINE_MAX_SIZE
+    if not probe.should_allreduce(torch.empty(shape, dtype=torch_dtype)):
+        nbytes = torch.empty(shape, dtype=torch_dtype).numel() * torch.empty(0, dtype=torch_dtype).element_size()
+        pytest.skip(f"outside the envelope: {nbytes} bytes, bound is {BASELINE_MAX_SIZE}")
     addr, port = rendezvous
-    case = Case(backend=backend, op=op, dtype=dtypes.d_dtypes[dtype], shape=shape, mode=mode)
+    case = Case(backend=backend, op=op, dtype=torch_dtype, shape=shape, mode=mode)
     got = run_case(case, world=world, addr=addr, port=port)
-    assert got.within_tolerance, (
-        f"{case}: worst|diff|={got.worst_diff:g} atol={got.atol:g}"
-        + (f" @replay {got.worst_at}" if got.worst_at >= 0 else ""))
+    # PRINTED on success too. pytest reports a pass as a dot, which says the case ran and nothing about
+    # by how much it passed -- and "within tolerance" and "bit exact" are different findings about a
+    # collective. `-s` in the workload is what lets this reach the log.
+    print(f"      {case}  worst|diff|={got.worst_diff:g}  atol={got.atol:g}"
+          + (f"  @replay {got.worst_at}" if got.worst_at >= 0 else ""), flush=True)
+    assert got.within_tolerance, f"{case}: outside tolerance (numbers above)"
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_one_communicator_survives_a_vllm_shaped_lifetime(backend: str, world: int,
+                                                          rendezvous: Tuple[str, int]) -> None:
+    """Eager, then a graph per batch bucket, then all of them replayed -- on ONE communicator.
+
+    The gate before any vLLM run: every other test tears the communicator down after one capture, so
+    this is the only one that exercises repeated deferred registration and the slot accounting behind
+    it. See `run_rank_lifetime`.
+    """
+    if world < 2:
+        pytest.skip("a collective needs at least two ranks")
+    addr, port = rendezvous
+    pool = Pool(processes=world)
+    init = get_distributed_init_method(addr, port)
+    try:
+        rets = [pool.apply_async(run_rank_lifetime,
+                                 args=(r, world, 1, backend, torch.bfloat16, init))
+                for r in range(world)]
+        pool.close()
+        per_rank = _collect(pool, rets)
+    finally:
+        pool.terminate()
+    ok = all(r[0] for r in per_rank)
+    _, worst_diff, worst_at, atol = max(per_rank, key=lambda r: r[1])
+    print(f"      {backend:5} lifetime: {len(VLLM_BUCKETS)} graphs x {LIFETIME_ROUNDS} rounds  "
+          f"worst|diff|={worst_diff:g}  atol={atol:g}", flush=True)
+    assert ok, f"{backend} drifted over its lifetime: worst|diff|={worst_diff:g} atol={atol:g}"
