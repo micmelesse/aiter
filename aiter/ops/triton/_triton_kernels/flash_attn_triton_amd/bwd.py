@@ -3332,7 +3332,7 @@ def _sliding_window_k_bounds(
     key=CAUSAL_AUTOTUNE_KEYS,
 )
 @triton.jit
-def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), batch)
+def bwd_kernel_fused_causal(
     Q,
     K,
     V,
@@ -3427,7 +3427,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 ):
     # program ids
     hkid = tl.program_id(0)
-    pid = tl.program_id(1)
+    # Separate gradient workgroups avoid a gfx950 miscompile with dropout and
+    # ALiBi: combining both phases loses the high half of the LSE pointer.
+    phase = tl.program_id(1) % 2
+    pid = tl.program_id(1) // 2
     bid = tl.program_id(2)
 
     # apply the xcd remapping for the hq dim
@@ -3471,7 +3474,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     GROUP_SIZE: tl.constexpr = HQ // HK
     # align the delta_qk
     start_n = pid * BLOCK_N1
-    if start_n < seqlen_k:
+    if phase == 0 and start_n < seqlen_k:
         # This section does dk and dv
         dk = tl.zeros([BLOCK_N1, HEAD_DIM_QK], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N1, HEAD_DIM_V], dtype=tl.float32)
@@ -3740,7 +3743,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 
     # This part does dq
     start_m = pid * BLOCK_M2
-    if start_m < seqlen_q:
+    if phase == 1 and start_m < seqlen_q:
         # seqlen_q > seqlen_k, no need to process these tile for dq
         if DEBUG_TRITON:
             print(
@@ -4803,7 +4806,15 @@ def attention_backward_triton_impl(
         def grid(META):
             return (
                 nheads_k,
-                ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+                (
+                    max(
+                        triton.cdiv(max_seqlen_k, META["BLOCK_N1"]),
+                        triton.cdiv(max_seqlen_q, META["BLOCK_M2"]),
+                    )
+                    * 2
+                    if causal
+                    else triton.cdiv(seqlen, META["BLOCK_N1"])
+                ),
                 batch,
             )
 
