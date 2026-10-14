@@ -3332,7 +3332,7 @@ def _sliding_window_k_bounds(
     key=CAUSAL_AUTOTUNE_KEYS,
 )
 @triton.jit
-def bwd_kernel_fused_causal(
+def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), batch)
     Q,
     K,
     V,
@@ -3427,10 +3427,7 @@ def bwd_kernel_fused_causal(
 ):
     # program ids
     hkid = tl.program_id(0)
-    # Separate gradient workgroups avoid a gfx950 miscompile with dropout and
-    # ALiBi: combining both phases loses the high half of the LSE pointer.
-    phase = tl.program_id(1) % 2
-    pid = tl.program_id(1) // 2
+    pid = tl.program_id(1)
     bid = tl.program_id(2)
 
     # apply the xcd remapping for the hq dim
@@ -3464,6 +3461,13 @@ def bwd_kernel_fused_causal(
             seqlen_q = q_end - q_start
             seqlen_k = k_end - k_start
 
+    # Resolve the sequence bases once; inner loops only select a query head.
+    Q += bid * stride_qb + q_start * stride_qm
+    DO += bid * stride_dob + q_start * stride_dom
+    DQ += bid * stride_dqb + q_start * stride_dqm
+    M += bid * stride_lse_b + q_start * stride_lse_m
+    Delta += bid * stride_delta_b + q_start * stride_delta_m
+
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
         print(f"delta_qk = {delta_qk}")
@@ -3474,7 +3478,7 @@ def bwd_kernel_fused_causal(
     GROUP_SIZE: tl.constexpr = HQ // HK
     # align the delta_qk
     start_n = pid * BLOCK_N1
-    if phase == 0 and start_n < seqlen_k:
+    if start_n < seqlen_k:
         # This section does dk and dv
         dk = tl.zeros([BLOCK_N1, HEAD_DIM_QK], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N1, HEAD_DIM_V], dtype=tl.float32)
@@ -3562,15 +3566,13 @@ def bwd_kernel_fused_causal(
                     print(f"residue_m = {residue_m}")
 
             # offset input and output tensor by batch and Q/K heads
-            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            adj_q = hqid * stride_qh
             Q_ptr = Q + adj_q
-            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            adj_do = hqid * stride_doh
             DO_ptr = DO + adj_do
-            adj_delta = (
-                bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
-            )
+            adj_delta = hqid * stride_delta_h
             Delta_ptr = Delta + adj_delta
-            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m
+            adj_m = hqid * stride_lse_h
             M_ptr = M + adj_m
 
             if USE_ALIBI:
@@ -3743,7 +3745,7 @@ def bwd_kernel_fused_causal(
 
     # This part does dq
     start_m = pid * BLOCK_M2
-    if phase == 1 and start_m < seqlen_q:
+    if start_m < seqlen_q:
         # seqlen_q > seqlen_k, no need to process these tile for dq
         if DEBUG_TRITON:
             print(
@@ -3782,13 +3784,11 @@ def bwd_kernel_fused_causal(
             if DEBUG_TRITON:
                 print(f"delta_qk: {delta_qk}; end_n: {end_n}")
             # offset input and output tensor by batch and Q/K heads
-            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
-            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
-            adj_delta = (
-                bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
-            )
+            adj_q = hqid * stride_qh
+            adj_do = hqid * stride_doh
+            adj_delta = hqid * stride_delta_h
             Delta_ptr = Delta + adj_delta
-            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m
+            adj_m = hqid * stride_lse_h
             M_ptr = M + adj_m
 
             if USE_ALIBI:
@@ -3952,7 +3952,7 @@ def bwd_kernel_fused_causal(
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             # Write back dQ.
-            adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
+            adj_dq = hqid * stride_dqh
             offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
@@ -4806,15 +4806,7 @@ def attention_backward_triton_impl(
         def grid(META):
             return (
                 nheads_k,
-                (
-                    max(
-                        triton.cdiv(max_seqlen_k, META["BLOCK_N1"]),
-                        triton.cdiv(max_seqlen_q, META["BLOCK_M2"]),
-                    )
-                    * 2
-                    if causal
-                    else triton.cdiv(seqlen, META["BLOCK_N1"])
-                ),
+                ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
                 batch,
             )
 

@@ -1472,20 +1472,6 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-# The 128-row tile produces non-finite softmax state for large causal dropout
-# heads on gfx950. Reuse the same kernel with a smaller tile for this case.
-attn_fwd_large_dropout = triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        )
-    ],
-    key=FWD_PREFILL_AUTOTUNE_KEYS,
-)(attn_fwd.fn)
-
-
 def attention_forward_prefill_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1890,16 +1876,7 @@ def attention_forward_prefill_triton_impl(
     def grid(META):
         return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
 
-    fwd_kernel = attn_fwd
-    if (
-        get_arch().name == "gfx950"
-        and causal
-        and dropout_p > 0
-        and padded_d_model_qk >= 128
-        and FWD_CONF_OVERRIDE is None
-    ):
-        fwd_kernel = attn_fwd_large_dropout
-    fwd_kernel[grid](
+    attn_fwd[grid](
         q,
         k,
         v,
