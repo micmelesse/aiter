@@ -3550,7 +3550,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
         v = tl.load(V + adj_v, mask=mask_v)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
-        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+        for group_idx in range(GROUP_SIZE):
+            hqid = hkid * GROUP_SIZE + group_idx
             if delta_qk >= 0:
                 start_m = start_n + start_delta
                 len_m = BLOCK_N1
@@ -3775,7 +3776,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
         V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
 
         # If MQA / GQA, set the K and V head offsets appropriately.
-        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+        for group_idx in range(GROUP_SIZE):
+            hqid = hkid * GROUP_SIZE + group_idx
             # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
             #   for every M-tile
             end_n = start_m + BLOCK_M2 - delta_qk
