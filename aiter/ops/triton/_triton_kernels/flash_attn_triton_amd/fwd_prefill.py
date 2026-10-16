@@ -500,55 +500,13 @@ def _attn_fwd_inner(
             rng_output = tl.rand(philox_seed, philox_ptrs)
             dropout_mask = rng_output > dropout_p
 
-            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
             if RETURN_SCORES:
                 sd_mask_value = tl.where(dropout_mask, p, -p)
-                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = (
-                    sd_mask_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
-                )
-
-                if APPLY_MASK and IS_CAUSAL:
-                    causal_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk
-                    )
-                    sd_store_mask = sd_store_mask & causal_constraint
-
-                if APPLY_MASK and USE_SLIDING_WINDOW:
-                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                        window_constraint = offs_m[:, None] >= 0
-                    elif WINDOW_SIZE_LEFT < 0:
-                        window_constraint = kv_offs_n[None, :] <= (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                    elif WINDOW_SIZE_RIGHT < 0:
-                        left_bound = (
-                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        )
-                        window_constraint = kv_offs_n[None, :] >= left_bound
-                    else:
-                        left_bound = (
-                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        )
-                        right_bound = (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                            kv_offs_n[None, :] <= right_bound
-                        )
-                    sd_store_mask = sd_store_mask & window_constraint
-
-                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-
-            # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
+            sd_mask_value = p
+
+        if RETURN_SCORES:
             sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
             sd_mask_ptrs = (
                 sd_mask_base
@@ -556,35 +514,8 @@ def _attn_fwd_inner(
                 + kv_offs_n[None, :] * stride_sn
             )
 
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
-            )
-
-            if APPLY_MASK and IS_CAUSAL:
-                causal_constraint = kv_offs_n[None, :] <= (
-                    offs_m[:, None] + seqlen_delta_qk
-                )
-                sd_store_mask = sd_store_mask & causal_constraint
-
-            if APPLY_MASK and USE_SLIDING_WINDOW:
-                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                    window_constraint = offs_m[:, None] >= 0
-                elif WINDOW_SIZE_LEFT < 0:
-                    window_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    )
-                elif WINDOW_SIZE_RIGHT < 0:
-                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                    window_constraint = kv_offs_n[None, :] >= left_bound
-                else:
-                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                        kv_offs_n[None, :] <= right_bound
-                    )
-                sd_store_mask = sd_store_mask & window_constraint
-
-            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
+            # Causal/window-masked probabilities are already zero.
+            tl.store(sd_mask_ptrs, sd_mask_value, mask=qk_mask)
 
         # -- update output accumulator --
         m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
