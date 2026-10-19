@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+      - 'aiter/ops/triton/attention/mha.py'
       - 'aiter/ops/triton/attention/mha_v3.py'
       - 'aiter/ops/triton/__init__.py'
       - 'aiter/ops/mha.py'
@@ -19,6 +20,7 @@ on:
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+      - 'aiter/ops/triton/attention/mha.py'
       - 'aiter/ops/triton/attention/mha_v3.py'
       - 'aiter/ops/triton/__init__.py'
       - 'aiter/ops/mha.py'
@@ -84,6 +86,7 @@ jobs:
               - '.github/workflows/ci-config.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+              - 'aiter/ops/triton/attention/mha.py'
               - 'aiter/ops/triton/attention/mha_v3.py'
               - 'aiter/ops/triton/__init__.py'
             ck:

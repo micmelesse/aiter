@@ -801,6 +801,20 @@ def test_mha_dao_ai_backward_head_size(
     head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
 ):
     from aiter.ops.triton.attention import mha
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+
+    monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
+    kernel = bwd.bwd_kernel_fused_causal
+    original_run = kernel.run
+    launches = 0
+
+    def trace_run(*args, **kwargs):
+        nonlocal launches
+        result = original_run(*args, **kwargs)
+        launches += 1
+        return result
+
+    monkeypatch.setattr(kernel, "run", trace_run)
 
     monkeypatch.setattr(mha, "_MHA_IMPL", "dao_ai")
     torch.manual_seed(20)
@@ -824,15 +838,18 @@ def test_mha_dao_ai_backward_head_size(
         requires_grad=True,
     )
     v = torch.randn_like(k, requires_grad=True)
-    if strided:
-        q, k, v = (
-            x.transpose(1, 2).contiguous().transpose(1, 2).detach().requires_grad_()
-            for x in (q, k, v)
-        )
     do = torch.randn_like(q)
     inputs = (q, k, v)
     if varlen:
         inputs = tuple(x.flatten(0, 1) for x in inputs)
+    if strided:
+        # Change token/head strides after packing so flatten cannot undo them.
+        inputs = tuple(
+            x.transpose(-3, -2).contiguous().transpose(-3, -2).detach().requires_grad_()
+            for x in inputs
+        )
+        assert all(not x.is_contiguous() for x in inputs)
+    if varlen:
         cu_q = torch.arange(
             0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
         )
@@ -845,6 +862,7 @@ def test_mha_dao_ai_backward_head_size(
     else:
         out = flash_attn_func(*inputs, causal=True, backend="triton")
     grads = torch.autograd.grad(out, inputs, do.reshape_as(out))
+    assert launches > 0, "Expected the Dao-AI fused causal backward kernel"
     ref_out, ref_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
         q, k, v, do, causal=True
     )
