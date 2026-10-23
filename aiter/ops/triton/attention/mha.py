@@ -17,9 +17,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _get_config as _get_gluon_config,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
-    kv_async_copy_ok as _gluon_kv_async_copy_ok,
-)
 from aiter.ops.triton._triton_kernels.attention.dao_ai import (
     flash_attn_2,
 )
@@ -1234,7 +1231,6 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
-            ctx.rng_state = rng_state
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
