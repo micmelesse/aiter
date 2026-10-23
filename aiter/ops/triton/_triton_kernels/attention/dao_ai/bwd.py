@@ -5,8 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import attention_mask
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.common import attention_mask
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
     AUTOTUNE,
     DEBUG,
     AutotuneMode,
