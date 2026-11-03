@@ -160,7 +160,7 @@ class TestTritonMhaAutograd(unittest.TestCase):
                         gradients = ctx.function.backward(ctx, Tensor(output.shape))
                         self.assertEqual(ctx.implementation, implementation)
                         self.assertIs(
-                            ctx.rng_state,
+                            ctx.saved_tensors[-1],
                             (
                                 namespace["_test_rng_state"]
                                 if implementation == "dao_ai"
