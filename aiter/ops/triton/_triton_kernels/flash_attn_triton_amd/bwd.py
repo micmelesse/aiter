@@ -3398,7 +3398,7 @@ def _bwd_causal_dkdv_tile(
                 USE_SLIDING_WINDOW,
                 WINDOW_SIZE_LEFT,
                 WINDOW_SIZE_RIGHT,
-                ACTUAL_HEAD_DIM_QK <= 128 and ACTUAL_HEAD_DIM_V <= 128,
+                True,
             )
         )
     shifted = tl.where(m[None, :] == float("-inf"), float("-inf"), logits - m[None, :])
@@ -5224,12 +5224,8 @@ def attention_backward_triton_impl(
 
         arch = get_arch()
         num_xcd = 1 if arch.is_rdna else 8
-        # Differing or large head dimensions have caused native aborts in the
-        # combined causal program on gfx950. Schedule those phases separately.
-        split_phases = causal and (
-            ACTUAL_HEAD_DIM_QK != ACTUAL_HEAD_DIM_V
-            or max(ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V) > 128
-        )
+        # Differing Q/K and V widths need separate phase programs.
+        split_phases = causal and ACTUAL_HEAD_DIM_QK != ACTUAL_HEAD_DIM_V
 
         def grid(META):
             return (
