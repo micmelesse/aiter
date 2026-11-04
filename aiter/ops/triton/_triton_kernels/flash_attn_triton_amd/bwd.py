@@ -3564,6 +3564,10 @@ def _bwd_causal_dkdv_phase(
                 full_end = tl.maximum(full_end, first_full)
             else:
                 full_end = num_m_blocks
+            if HEAD_DIM_QK > 128 or HEAD_DIM_V > 128:
+                # Large heads use one masked loop to keep the compiled phase small.
+                first_full = num_m_blocks
+                full_end = num_m_blocks
             for m_block in tl.range(first_full, num_stages=1):
                 dk, dv = _bwd_causal_dkdv_tile(
                     k,
@@ -3971,6 +3975,9 @@ def _bwd_causal_dq_phase(
                 num_n_blocks,
             )
             full_end = tl.maximum(full_end, first_full)
+            if HEAD_DIM_QK > 128 or HEAD_DIM_V > 128:
+                first_full = num_n_blocks
+                full_end = num_n_blocks
             for n_block in tl.range(first_full, num_stages=1):
                 dq = _bwd_causal_dq_tile(
                     K,
