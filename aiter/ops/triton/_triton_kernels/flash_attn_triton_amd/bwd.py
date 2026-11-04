@@ -3804,10 +3804,11 @@ def bwd_kernel_fused_causal(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
+    SPLIT_PHASES: tl.constexpr = False,
 ):
     hkid = remap_xcd(tl.program_id(0), HK, NUM_XCD)
     phase_pid = tl.program_id(1)
-    pid = phase_pid // 2
+    pid = phase_pid // 2 if SPLIT_PHASES else phase_pid
     bid = tl.program_id(2)
 
     q_start = 0
@@ -3839,70 +3840,7 @@ def bwd_kernel_fused_causal(
     DV += bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
     GROUP_SIZE: tl.constexpr = HQ // HK
 
-    if phase_pid % 2:
-        _bwd_causal_dq_phase(
-            Q=Q,
-            K=K,
-            V=V,
-            DO=DO,
-            DQ=DQ,
-            M=M,
-            Delta=Delta,
-            Alibi_slopes=Alibi_slopes,
-            Descale_q=Descale_q,
-            Descale_k=Descale_k,
-            Descale_v=Descale_v,
-            bid=bid,
-            hkid=hkid,
-            pid=pid,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            sm_scale=sm_scale,
-            dropout_p=dropout_p,
-            philox_seed=philox_seed,
-            philox_offset_base=philox_offset_base,
-            stride_qh=stride_qh,
-            stride_qm=stride_qm,
-            stride_qd=stride_qd,
-            stride_doh=stride_doh,
-            stride_dom=stride_dom,
-            stride_dod=stride_dod,
-            stride_dqh=stride_dqh,
-            stride_dqm=stride_dqm,
-            stride_dqd=stride_dqd,
-            stride_kn=stride_kn,
-            stride_kd=stride_kd,
-            stride_vn=stride_vn,
-            stride_vd=stride_vd,
-            stride_lse_h=stride_lse_h,
-            stride_lse_m=stride_lse_m,
-            stride_delta_h=stride_delta_h,
-            stride_delta_m=stride_delta_m,
-            stride_dropoutb=stride_dropoutb,
-            stride_dropouth=stride_dropouth,
-            stride_dropoutm=stride_dropoutm,
-            stride_dropoutn=stride_dropoutn,
-            stride_az=stride_az,
-            stride_ah=stride_ah,
-            stride_descale_q_z=stride_descale_q_z,
-            stride_descale_k_z=stride_descale_k_z,
-            stride_descale_v_z=stride_descale_v_z,
-            GROUP_SIZE=GROUP_SIZE,
-            BLOCK_M2=BLOCK_M2,
-            BLOCK_N2=BLOCK_N2,
-            HEAD_DIM_QK=HEAD_DIM_QK,
-            HEAD_DIM_V=HEAD_DIM_V,
-            ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
-            ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
-            ENABLE_DROPOUT=ENABLE_DROPOUT,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            IS_FP8=IS_FP8,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-        )
-    else:
+    if not SPLIT_PHASES or phase_pid % 2 == 0:
         _bwd_causal_dkdv_phase(
             Q=Q,
             K=K,
@@ -3955,6 +3893,69 @@ def bwd_kernel_fused_causal(
             GROUP_SIZE=GROUP_SIZE,
             BLOCK_M1=BLOCK_M1,
             BLOCK_N1=BLOCK_N1,
+            HEAD_DIM_QK=HEAD_DIM_QK,
+            HEAD_DIM_V=HEAD_DIM_V,
+            ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
+            ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
+            ENABLE_DROPOUT=ENABLE_DROPOUT,
+            USE_ALIBI=USE_ALIBI,
+            USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
+            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+        )
+    if not SPLIT_PHASES or phase_pid % 2 == 1:
+        _bwd_causal_dq_phase(
+            Q=Q,
+            K=K,
+            V=V,
+            DO=DO,
+            DQ=DQ,
+            M=M,
+            Delta=Delta,
+            Alibi_slopes=Alibi_slopes,
+            Descale_q=Descale_q,
+            Descale_k=Descale_k,
+            Descale_v=Descale_v,
+            bid=bid,
+            hkid=hkid,
+            pid=pid,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            sm_scale=sm_scale,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset_base=philox_offset_base,
+            stride_qh=stride_qh,
+            stride_qm=stride_qm,
+            stride_qd=stride_qd,
+            stride_doh=stride_doh,
+            stride_dom=stride_dom,
+            stride_dod=stride_dod,
+            stride_dqh=stride_dqh,
+            stride_dqm=stride_dqm,
+            stride_dqd=stride_dqd,
+            stride_kn=stride_kn,
+            stride_kd=stride_kd,
+            stride_vn=stride_vn,
+            stride_vd=stride_vd,
+            stride_lse_h=stride_lse_h,
+            stride_lse_m=stride_lse_m,
+            stride_delta_h=stride_delta_h,
+            stride_delta_m=stride_delta_m,
+            stride_dropoutb=stride_dropoutb,
+            stride_dropouth=stride_dropouth,
+            stride_dropoutm=stride_dropoutm,
+            stride_dropoutn=stride_dropoutn,
+            stride_az=stride_az,
+            stride_ah=stride_ah,
+            stride_descale_q_z=stride_descale_q_z,
+            stride_descale_k_z=stride_descale_k_z,
+            stride_descale_v_z=stride_descale_v_z,
+            GROUP_SIZE=GROUP_SIZE,
+            BLOCK_M2=BLOCK_M2,
+            BLOCK_N2=BLOCK_N2,
             HEAD_DIM_QK=HEAD_DIM_QK,
             HEAD_DIM_V=HEAD_DIM_V,
             ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
@@ -4812,12 +4813,13 @@ def attention_backward_triton_impl(
 
         arch = get_arch()
         num_xcd = 1 if arch.is_rdna else 8
-        phase_count = 2 if causal else 1
+        split_phases = causal and ACTUAL_HEAD_DIM_QK != ACTUAL_HEAD_DIM_V
 
         def grid(META):
             return (
                 nheads_k,
-                phase_count * ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+                (2 if split_phases else 1)
+                * ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
                 batch,
             )
 
@@ -4916,6 +4918,7 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                SPLIT_PHASES=split_phases,
             )
         else:
             bwd_kernel_fused_noncausal[grid](
