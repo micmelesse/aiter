@@ -4813,7 +4813,12 @@ def attention_backward_triton_impl(
 
         arch = get_arch()
         num_xcd = 1 if arch.is_rdna else 8
-        split_phases = causal and ACTUAL_HEAD_DIM_QK != ACTUAL_HEAD_DIM_V
+        # Differing or large head dimensions have caused native aborts in the
+        # combined causal program on gfx950. Schedule those phases separately.
+        split_phases = causal and (
+            ACTUAL_HEAD_DIM_QK != ACTUAL_HEAD_DIM_V
+            or max(ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V) > 128
+        )
 
         def grid(META):
             return (
