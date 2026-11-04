@@ -3312,6 +3312,123 @@ def _sliding_window_k_bounds(
 
 
 @triton.jit
+def _bwd_causal_dkdv_tile(
+    k,
+    v,
+    dk,
+    dv,
+    offs_n,
+    offs_d_qk,
+    offs_d_v,
+    q_base,
+    do_base,
+    m_base,
+    delta_base,
+    start_m,
+    m_block,
+    seqlen_q,
+    seqlen_k,
+    sm_scale,
+    dropout_p,
+    philox_seed,
+    rng_base,
+    dropout_scale,
+    alibi_slope,
+    descale_q,
+    descale_k,
+    descale_v,
+    stride_qm,
+    stride_qd,
+    stride_dom,
+    stride_dod,
+    stride_lse_m,
+    stride_delta_m,
+    stride_dropoutm,
+    stride_dropoutn,
+    BLOCK_M1: tl.constexpr,
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+    APPLY_MASK: tl.constexpr,
+):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    offs_m = start_m + m_block * BLOCK_M1 + tl.arange(0, BLOCK_M1)
+    valid_m = offs_m < seqlen_q
+    qT = tl.load(
+        q_base + offs_m[None, :] * stride_qm + offs_d_qk[:, None] * stride_qd,
+        mask=valid_m[None, :] & (offs_d_qk[:, None] < ACTUAL_HEAD_DIM_QK),
+        other=0.0,
+    )
+    do = tl.load(
+        do_base + offs_m[:, None] * stride_dom + offs_d_v[None, :] * stride_dod,
+        mask=valid_m[:, None] & (offs_d_v[None, :] < ACTUAL_HEAD_DIM_V),
+        other=0.0,
+    )
+    m = tl.load(m_base + offs_m * stride_lse_m, mask=valid_m, other=0.0)
+    delta = tl.load(delta_base + offs_m * stride_delta_m, mask=valid_m, other=0.0)
+    if ENABLE_DROPOUT:
+        rng_offsets = (
+            rng_base
+            + offs_m[None, :] * stride_dropoutm
+            + offs_n[:, None] * stride_dropoutn
+        )
+        keep = tl.rand(philox_seed, rng_offsets) > dropout_p
+
+    if IS_FP8:
+        logits = tl.dot(k, qT) * descale_q * descale_k * sm_scale
+    else:
+        logits = tl.dot(k, qT) * sm_scale
+    if USE_ALIBI:
+        rel = offs_n[:, None] + seqlen_q - seqlen_k - offs_m[None, :]
+        logits += -alibi_slope * tl.abs(rel)
+    if APPLY_MASK:
+        allowed = tl.trans(
+            attention_mask(
+                offs_m,
+                offs_n,
+                seqlen_q,
+                seqlen_k,
+                True,
+                USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
+            )
+        )
+    shifted = tl.where(m[None, :] == float("-inf"), float("-inf"), logits - m[None, :])
+    if USE_EXP2:
+        pT = tl.math.exp2(shifted * RCP_LN2)
+    else:
+        pT = tl.math.exp(shifted)
+    if APPLY_MASK:
+        pT = tl.where(allowed, pT, 0.0)
+
+    if ENABLE_DROPOUT:
+        pT_dropout = pT * keep.to(pT.dtype) * dropout_scale
+        dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
+    else:
+        dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
+    if IS_FP8:
+        dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
+    else:
+        dpT = tl.dot(v, tl.trans(do))
+    if ENABLE_DROPOUT:
+        dpT *= keep.to(dpT.dtype) * dropout_scale
+    dsT = pT * (dpT - delta[None, :])
+    if IS_FP8:
+        dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
+        dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
+    else:
+        dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
+    return dk, dv
+
+
+@triton.jit
 def _bwd_causal_dkdv_phase(
     Q,
     K,
@@ -3397,21 +3514,25 @@ def _bwd_causal_dkdv_phase(
         )
         dk = tl.zeros([BLOCK_N1, HEAD_DIM_QK], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N1, HEAD_DIM_V], dtype=tl.float32)
-        RCP_LN2: tl.constexpr = 1.4426950408889634
-
         for group_idx in range(GROUP_SIZE):
             hqid = hkid * GROUP_SIZE + group_idx
             q_base = Q + hqid * stride_qh
             do_base = DO + hqid * stride_doh
             m_base = M + hqid * stride_lse_h
             delta_base = Delta + hqid * stride_delta_h
+            alibi_slope = 0.0
             if USE_ALIBI:
                 alibi_slope = tl.load(Alibi_slopes + bid * stride_az + hqid * stride_ah)
+            rng_base = 0
+            dropout_scale = 1.0
             if ENABLE_DROPOUT:
                 rng_base = (
                     philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
                 )
                 dropout_scale = 1.0 / (1.0 - dropout_p)
+            descale_q = 1.0
+            descale_k = 1.0
+            descale_v = 1.0
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
@@ -3428,81 +3549,159 @@ def _bwd_causal_dkdv_phase(
                 BLOCK_N1,
                 BLOCK_M1,
             )
-            for m_block in tl.range(num_m_blocks, num_stages=1):
-                offs_m = start_m + m_block * BLOCK_M1 + tl.arange(0, BLOCK_M1)
-                valid_m = offs_m < seqlen_q
-                qT = tl.load(
-                    q_base
-                    + offs_m[None, :] * stride_qm
-                    + offs_d_qk[:, None] * stride_qd,
-                    mask=valid_m[None, :] & (offs_d_qk[:, None] < ACTUAL_HEAD_DIM_QK),
-                    other=0.0,
+            offset = seqlen_k - seqlen_q
+            first_full = tl.minimum(
+                tl.cdiv(
+                    tl.maximum(start_n + BLOCK_N1 - 1 - offset - start_m, 0), BLOCK_M1
+                ),
+                num_m_blocks,
+            )
+            if WINDOW_SIZE_LEFT >= 0:
+                last_full = start_n - offset + WINDOW_SIZE_LEFT - BLOCK_M1 + 1
+                full_end = tl.minimum(
+                    tl.maximum((last_full - start_m) // BLOCK_M1 + 1, 0), num_m_blocks
                 )
-                do = tl.load(
-                    do_base
-                    + offs_m[:, None] * stride_dom
-                    + offs_d_v[None, :] * stride_dod,
-                    mask=valid_m[:, None] & (offs_d_v[None, :] < ACTUAL_HEAD_DIM_V),
-                    other=0.0,
+                full_end = tl.maximum(full_end, first_full)
+            else:
+                full_end = num_m_blocks
+            for m_block in tl.range(first_full, num_stages=1):
+                dk, dv = _bwd_causal_dkdv_tile(
+                    k,
+                    v,
+                    dk,
+                    dv,
+                    offs_n,
+                    offs_d_qk,
+                    offs_d_v,
+                    q_base,
+                    do_base,
+                    m_base,
+                    delta_base,
+                    start_m,
+                    m_block,
+                    seqlen_q,
+                    seqlen_k,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    rng_base,
+                    dropout_scale,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    stride_qm,
+                    stride_qd,
+                    stride_dom,
+                    stride_dod,
+                    stride_lse_m,
+                    stride_delta_m,
+                    stride_dropoutm,
+                    stride_dropoutn,
+                    BLOCK_M1,
+                    ACTUAL_HEAD_DIM_QK,
+                    ACTUAL_HEAD_DIM_V,
+                    ENABLE_DROPOUT,
+                    IS_FP8,
+                    USE_ALIBI,
+                    USE_EXP2,
+                    USE_SLIDING_WINDOW,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    True,
                 )
-                m = tl.load(m_base + offs_m * stride_lse_m, mask=valid_m, other=0.0)
-                delta = tl.load(
-                    delta_base + offs_m * stride_delta_m, mask=valid_m, other=0.0
+            for m_block in tl.range(first_full, full_end, num_stages=1):
+                dk, dv = _bwd_causal_dkdv_tile(
+                    k,
+                    v,
+                    dk,
+                    dv,
+                    offs_n,
+                    offs_d_qk,
+                    offs_d_v,
+                    q_base,
+                    do_base,
+                    m_base,
+                    delta_base,
+                    start_m,
+                    m_block,
+                    seqlen_q,
+                    seqlen_k,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    rng_base,
+                    dropout_scale,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    stride_qm,
+                    stride_qd,
+                    stride_dom,
+                    stride_dod,
+                    stride_lse_m,
+                    stride_delta_m,
+                    stride_dropoutm,
+                    stride_dropoutn,
+                    BLOCK_M1,
+                    ACTUAL_HEAD_DIM_QK,
+                    ACTUAL_HEAD_DIM_V,
+                    ENABLE_DROPOUT,
+                    IS_FP8,
+                    USE_ALIBI,
+                    USE_EXP2,
+                    USE_SLIDING_WINDOW,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    False,
                 )
-                if ENABLE_DROPOUT:
-                    rng_offsets = (
-                        rng_base
-                        + offs_m[None, :] * stride_dropoutm
-                        + offs_n[:, None] * stride_dropoutn
-                    )
-                    keep = tl.rand(philox_seed, rng_offsets) > dropout_p
-
-                if IS_FP8:
-                    logits = tl.dot(k, qT) * descale_q * descale_k * sm_scale
-                else:
-                    logits = tl.dot(k, qT) * sm_scale
-                if USE_ALIBI:
-                    rel = offs_n[:, None] + seqlen_q - seqlen_k - offs_m[None, :]
-                    logits += -alibi_slope * tl.abs(rel)
-                allowed = tl.trans(
-                    attention_mask(
-                        offs_m,
-                        offs_n,
-                        seqlen_q,
-                        seqlen_k,
-                        True,
-                        USE_SLIDING_WINDOW,
-                        WINDOW_SIZE_LEFT,
-                        WINDOW_SIZE_RIGHT,
-                    )
+            for m_block in tl.range(full_end, num_m_blocks, num_stages=1):
+                dk, dv = _bwd_causal_dkdv_tile(
+                    k,
+                    v,
+                    dk,
+                    dv,
+                    offs_n,
+                    offs_d_qk,
+                    offs_d_v,
+                    q_base,
+                    do_base,
+                    m_base,
+                    delta_base,
+                    start_m,
+                    m_block,
+                    seqlen_q,
+                    seqlen_k,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    rng_base,
+                    dropout_scale,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    stride_qm,
+                    stride_qd,
+                    stride_dom,
+                    stride_dod,
+                    stride_lse_m,
+                    stride_delta_m,
+                    stride_dropoutm,
+                    stride_dropoutn,
+                    BLOCK_M1,
+                    ACTUAL_HEAD_DIM_QK,
+                    ACTUAL_HEAD_DIM_V,
+                    ENABLE_DROPOUT,
+                    IS_FP8,
+                    USE_ALIBI,
+                    USE_EXP2,
+                    USE_SLIDING_WINDOW,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    True,
                 )
-                shifted = tl.where(
-                    m[None, :] == float("-inf"), float("-inf"), logits - m[None, :]
-                )
-                if USE_EXP2:
-                    pT = tl.math.exp2(shifted * RCP_LN2)
-                else:
-                    pT = tl.math.exp(shifted)
-                pT = tl.where(allowed, pT, 0.0)
-
-                if ENABLE_DROPOUT:
-                    pT_dropout = pT * keep.to(pT.dtype) * dropout_scale
-                    dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
-                else:
-                    dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
-                if IS_FP8:
-                    dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
-                else:
-                    dpT = tl.dot(v, tl.trans(do))
-                if ENABLE_DROPOUT:
-                    dpT *= keep.to(dpT.dtype) * dropout_scale
-                dsT = pT * (dpT - delta[None, :])
-                if IS_FP8:
-                    dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
-                    dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
-                else:
-                    dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
-
         tl.store(
             DV + offs_n[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd,
             dv,
@@ -3513,6 +3712,110 @@ def _bwd_causal_dkdv_phase(
             dk * sm_scale,
             mask=mask_k,
         )
+
+
+@triton.jit
+def _bwd_causal_dq_tile(
+    K,
+    V,
+    q,
+    do,
+    m,
+    delta,
+    dq,
+    offs_m,
+    offs_d_qk,
+    offs_d_v,
+    start_n,
+    n_block,
+    seqlen_q,
+    seqlen_k,
+    sm_scale,
+    dropout_p,
+    philox_seed,
+    rng_base,
+    dropout_scale,
+    alibi_slope,
+    descale_q,
+    descale_k,
+    descale_v,
+    stride_kn,
+    stride_kd,
+    stride_vn,
+    stride_vd,
+    stride_dropoutm,
+    stride_dropoutn,
+    BLOCK_N2: tl.constexpr,
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+    APPLY_MASK: tl.constexpr,
+):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    offs_n = start_n + n_block * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+    valid_n = offs_n < seqlen_k
+    kT = tl.load(
+        K + offs_n[None, :] * stride_kn + offs_d_qk[:, None] * stride_kd,
+        mask=valid_n[None, :] & (offs_d_qk[:, None] < ACTUAL_HEAD_DIM_QK),
+        other=0.0,
+    )
+    vT = tl.load(
+        V + offs_n[None, :] * stride_vn + offs_d_v[:, None] * stride_vd,
+        mask=valid_n[None, :] & (offs_d_v[:, None] < ACTUAL_HEAD_DIM_V),
+        other=0.0,
+    )
+    if ENABLE_DROPOUT:
+        rng_offsets = (
+            rng_base
+            + offs_m[:, None] * stride_dropoutm
+            + offs_n[None, :] * stride_dropoutn
+        )
+        keep = tl.rand(philox_seed, rng_offsets) > dropout_p
+
+    if IS_FP8:
+        logits = tl.dot(q, kT) * descale_q * descale_k * sm_scale
+    else:
+        logits = tl.dot(q, kT) * sm_scale
+    if USE_ALIBI:
+        rel = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
+        logits += -alibi_slope * tl.abs(rel)
+    if APPLY_MASK:
+        allowed = attention_mask(
+            offs_m,
+            offs_n,
+            seqlen_q,
+            seqlen_k,
+            True,
+            USE_SLIDING_WINDOW,
+            WINDOW_SIZE_LEFT,
+            WINDOW_SIZE_RIGHT,
+        )
+    shifted = tl.where(m == float("-inf"), float("-inf"), logits - m)
+    if APPLY_MASK:
+        shifted = tl.where(allowed, shifted, float("-inf"))
+    if USE_EXP2:
+        p = tl.math.exp2(shifted * RCP_LN2)
+    else:
+        p = tl.math.exp(shifted)
+    if IS_FP8:
+        dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
+    else:
+        dp = tl.dot(do, vT)
+    if ENABLE_DROPOUT:
+        dp *= keep.to(dp.dtype) * dropout_scale
+    ds = p * (dp - delta)
+    if IS_FP8:
+        ds_transposed = tl.trans(ds).to(kT.type.element_ty)
+        dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
+    else:
+        dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
+    return dq
 
 
 @triton.jit
@@ -3586,8 +3889,6 @@ def _bwd_causal_dq_phase(
         valid_m = offs_m < seqlen_q
         mask_q = valid_m[:, None] & (offs_d_qk[None, :] < ACTUAL_HEAD_DIM_QK)
         mask_do = valid_m[:, None] & (offs_d_v[None, :] < ACTUAL_HEAD_DIM_V)
-        RCP_LN2: tl.constexpr = 1.4426950408889634
-
         for group_idx in range(GROUP_SIZE):
             hqid = hkid * GROUP_SIZE + group_idx
             q = tl.load(
@@ -3616,13 +3917,19 @@ def _bwd_causal_dq_phase(
                 mask=valid_m,
                 other=0.0,
             )[:, None]
+            alibi_slope = 0.0
             if USE_ALIBI:
                 alibi_slope = tl.load(Alibi_slopes + bid * stride_az + hqid * stride_ah)
+            rng_base = 0
+            dropout_scale = 1.0
             if ENABLE_DROPOUT:
                 rng_base = (
                     philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
                 )
                 dropout_scale = 1.0 / (1.0 - dropout_p)
+            descale_q = 1.0
+            descale_k = 1.0
+            descale_v = 1.0
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
@@ -3640,63 +3947,159 @@ def _bwd_causal_dq_phase(
                 BLOCK_M2,
                 BLOCK_N2,
             )
-            for n_block in tl.range(num_n_blocks, num_stages=1):
-                offs_n = start_n + n_block * BLOCK_N2 + tl.arange(0, BLOCK_N2)
-                valid_n = offs_n < seqlen_k
-                kT = tl.load(
-                    K + offs_n[None, :] * stride_kn + offs_d_qk[:, None] * stride_kd,
-                    mask=valid_n[None, :] & (offs_d_qk[:, None] < ACTUAL_HEAD_DIM_QK),
-                    other=0.0,
+            offset = seqlen_k - seqlen_q
+            if WINDOW_SIZE_LEFT >= 0:
+                first_full = tl.minimum(
+                    tl.cdiv(
+                        tl.maximum(
+                            start_m
+                            + BLOCK_M2
+                            - 1
+                            + offset
+                            - WINDOW_SIZE_LEFT
+                            - start_n,
+                            0,
+                        ),
+                        BLOCK_N2,
+                    ),
+                    num_n_blocks,
                 )
-                vT = tl.load(
-                    V + offs_n[None, :] * stride_vn + offs_d_v[:, None] * stride_vd,
-                    mask=valid_n[None, :] & (offs_d_v[:, None] < ACTUAL_HEAD_DIM_V),
-                    other=0.0,
-                )
-                if ENABLE_DROPOUT:
-                    rng_offsets = (
-                        rng_base
-                        + offs_m[:, None] * stride_dropoutm
-                        + offs_n[None, :] * stride_dropoutn
-                    )
-                    keep = tl.rand(philox_seed, rng_offsets) > dropout_p
-
-                if IS_FP8:
-                    logits = tl.dot(q, kT) * descale_q * descale_k * sm_scale
-                else:
-                    logits = tl.dot(q, kT) * sm_scale
-                if USE_ALIBI:
-                    rel = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
-                    logits += -alibi_slope * tl.abs(rel)
-                allowed = attention_mask(
+            else:
+                first_full = 0
+            full_end = tl.minimum(
+                tl.maximum((start_m + offset - start_n + 1) // BLOCK_N2, 0),
+                num_n_blocks,
+            )
+            full_end = tl.maximum(full_end, first_full)
+            for n_block in tl.range(first_full, num_stages=1):
+                dq = _bwd_causal_dq_tile(
+                    K,
+                    V,
+                    q,
+                    do,
+                    m,
+                    delta,
+                    dq,
                     offs_m,
-                    offs_n,
+                    offs_d_qk,
+                    offs_d_v,
+                    start_n,
+                    n_block,
                     seqlen_q,
                     seqlen_k,
-                    True,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    rng_base,
+                    dropout_scale,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    stride_kn,
+                    stride_kd,
+                    stride_vn,
+                    stride_vd,
+                    stride_dropoutm,
+                    stride_dropoutn,
+                    BLOCK_N2,
+                    ACTUAL_HEAD_DIM_QK,
+                    ACTUAL_HEAD_DIM_V,
+                    ENABLE_DROPOUT,
+                    IS_FP8,
+                    USE_ALIBI,
+                    USE_EXP2,
                     USE_SLIDING_WINDOW,
                     WINDOW_SIZE_LEFT,
                     WINDOW_SIZE_RIGHT,
+                    True,
                 )
-                shifted = tl.where(m == float("-inf"), float("-inf"), logits - m)
-                shifted = tl.where(allowed, shifted, float("-inf"))
-                if USE_EXP2:
-                    p = tl.math.exp2(shifted * RCP_LN2)
-                else:
-                    p = tl.math.exp(shifted)
-                if IS_FP8:
-                    dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
-                else:
-                    dp = tl.dot(do, vT)
-                if ENABLE_DROPOUT:
-                    dp *= keep.to(dp.dtype) * dropout_scale
-                ds = p * (dp - delta)
-                if IS_FP8:
-                    ds_transposed = tl.trans(ds).to(kT.type.element_ty)
-                    dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
-                else:
-                    dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
-
+            for n_block in tl.range(first_full, full_end, num_stages=1):
+                dq = _bwd_causal_dq_tile(
+                    K,
+                    V,
+                    q,
+                    do,
+                    m,
+                    delta,
+                    dq,
+                    offs_m,
+                    offs_d_qk,
+                    offs_d_v,
+                    start_n,
+                    n_block,
+                    seqlen_q,
+                    seqlen_k,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    rng_base,
+                    dropout_scale,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    stride_kn,
+                    stride_kd,
+                    stride_vn,
+                    stride_vd,
+                    stride_dropoutm,
+                    stride_dropoutn,
+                    BLOCK_N2,
+                    ACTUAL_HEAD_DIM_QK,
+                    ACTUAL_HEAD_DIM_V,
+                    ENABLE_DROPOUT,
+                    IS_FP8,
+                    USE_ALIBI,
+                    USE_EXP2,
+                    USE_SLIDING_WINDOW,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    False,
+                )
+            for n_block in tl.range(full_end, num_n_blocks, num_stages=1):
+                dq = _bwd_causal_dq_tile(
+                    K,
+                    V,
+                    q,
+                    do,
+                    m,
+                    delta,
+                    dq,
+                    offs_m,
+                    offs_d_qk,
+                    offs_d_v,
+                    start_n,
+                    n_block,
+                    seqlen_q,
+                    seqlen_k,
+                    sm_scale,
+                    dropout_p,
+                    philox_seed,
+                    rng_base,
+                    dropout_scale,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    stride_kn,
+                    stride_kd,
+                    stride_vn,
+                    stride_vd,
+                    stride_dropoutm,
+                    stride_dropoutn,
+                    BLOCK_N2,
+                    ACTUAL_HEAD_DIM_QK,
+                    ACTUAL_HEAD_DIM_V,
+                    ENABLE_DROPOUT,
+                    IS_FP8,
+                    USE_ALIBI,
+                    USE_EXP2,
+                    USE_SLIDING_WINDOW,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    True,
+                )
             tl.store(
                 DQ
                 + hqid * stride_dqh
