@@ -128,6 +128,51 @@ def test_mha_dao_ai_causal_dropout_alibi_backward(
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
+def test_mha_dao_ai_packed_kv_large_head_backward(dao_ai_impl):
+    """Causal MQA backward with strided K/V views and an odd K length."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 causal backward configuration regression")
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        4, 128, 6, 160, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    kv = torch.randn(
+        4, 217, 2, 1, 160, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    k, v = kv.unbind(2)
+    slopes = torch.rand(4, 6, device="cuda", dtype=torch.float32) * 0.3
+    out, scores = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=0.17,
+        causal=True,
+        alibi_slopes=slopes,
+        return_attn_probs=True,
+    )
+    do = torch.randn_like(out)
+    dq, dkv = torch.autograd.grad(out, (q, kv), do)
+
+    bias = attn_bias_from_alibi_slopes(slopes, 128, 217, causal=True)
+    out_ref, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        attn_bias=bias,
+        dropout_p=0.17,
+        dropout_mask=scores >= 0,
+        causal=True,
+    )
+    dq_ref, dkv_ref = torch.autograd.grad(out_ref, (q, kv), do)
+    torch.cuda.synchronize()
+    for actual, expected in ((dq, dq_ref), (dkv, dkv_ref)):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, VARLEN, BWD, WINDOW_SIZE",
     [
