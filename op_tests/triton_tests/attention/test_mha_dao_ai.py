@@ -52,19 +52,20 @@ def dao_ai_impl():
 
 
 @pytest.mark.parametrize(
-    "batch,seqlen_q,seqlen_k,head_dim,nheads_k",
+    "batch,seqlen_q,seqlen_k,head_dim,nheads_k,use_alibi",
     [
-        (4, 113, 203, 40, 6),  # Catches the dK/dV regression from split specialization.
-        (4, 256, 512, 40, 1),  # MQA with more K tokens than Q tokens.
-        (4, 256, 512, 40, 2),  # GQA with more K tokens than Q tokens.
-        (4, 113, 203, 59, 6),
-        (1, 256, 256, 64, 6),
-        (4, 113, 203, 160, 1),  # MQA with a padded head dimension.
+        (4, 113, 203, 40, 6, True),  # dK/dV split-specialization regression.
+        (4, 256, 512, 40, 1, True),  # MQA with more K tokens than Q tokens.
+        (4, 256, 512, 40, 2, True),  # GQA with more K tokens than Q tokens.
+        (4, 113, 203, 59, 6, True),
+        (1, 256, 256, 64, 6, True),
+        (4, 113, 203, 160, 1, True),  # MQA with a padded head dimension.
+        (4, 108, 256, 128, 1, False),  # Short-Q causal dQ without ALiBi.
     ],
 )
 @pytest.mark.parametrize("varlen", [False, True])
 def test_mha_dao_ai_causal_dropout_alibi_backward(
-    dao_ai_impl, batch, seqlen_q, seqlen_k, head_dim, nheads_k, varlen
+    dao_ai_impl, batch, seqlen_q, seqlen_k, head_dim, nheads_k, use_alibi, varlen
 ):
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -78,7 +79,11 @@ def test_mha_dao_ai_causal_dropout_alibi_backward(
     q = torch.randn(shape_q, device="cuda", dtype=torch.float16, requires_grad=True)
     k = torch.randn(shape_kv, device="cuda", dtype=torch.float16, requires_grad=True)
     v = torch.randn(shape_kv, device="cuda", dtype=torch.float16, requires_grad=True)
-    slopes = torch.rand(batch, heads, device="cuda", dtype=torch.float32) * 0.3
+    slopes = (
+        torch.rand(batch, heads, device="cuda", dtype=torch.float32) * 0.3
+        if use_alibi
+        else None
+    )
     dropout_p = 0.17
 
     softmax_scale = head_dim**-0.5
@@ -112,7 +117,11 @@ def test_mha_dao_ai_causal_dropout_alibi_backward(
     do = torch.randn_like(out)
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), do)
 
-    bias = attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=True)
+    bias = (
+        attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=True)
+        if use_alibi
+        else None
+    )
     out_ref, _, _ = attention_ref(
         q,
         k,
