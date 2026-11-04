@@ -3398,7 +3398,7 @@ def _bwd_causal_dkdv_tile(
                 USE_SLIDING_WINDOW,
                 WINDOW_SIZE_LEFT,
                 WINDOW_SIZE_RIGHT,
-                True,
+                ACTUAL_HEAD_DIM_QK <= 128 and ACTUAL_HEAD_DIM_V <= 128,
             )
         )
     shifted = tl.where(m[None, :] == float("-inf"), float("-inf"), logits - m[None, :])
