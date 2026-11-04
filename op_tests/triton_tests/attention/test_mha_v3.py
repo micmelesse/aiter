@@ -31,6 +31,24 @@ _supports_fp8 = _arch in FP8_ARCHS
 SEED = 0
 
 
+def test_mha_v3_short_k_mqa_dq():
+    """Check dQ when causal MQA has mostly masked query rows and a smaller V head."""
+    torch.manual_seed(0)
+    q = torch.randn(
+        9, 799, 6, 192, device="cuda", dtype=torch.bfloat16
+    ).requires_grad_()
+    k = torch.randn(9, 3, 1, 192, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    v = torch.randn(9, 3, 1, 128, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    do = torch.randn(9, 799, 6, 128, device="cuda", dtype=torch.bfloat16)
+    _, (dq_ref, _, _), _, bwd_tols = attention_ref_with_tol(q, k, v, do, causal=True)
+
+    out = flash_attn_func(q, k, v, causal=True)
+    dq = torch.autograd.grad(out, (q, k, v), do)[0]
+    torch.cuda.synchronize()
+    atol, rtol = bwd_tols[0]
+    torch.testing.assert_close(dq, dq_ref, atol=atol, rtol=rtol)
+
+
 # adopted from
 # https://github.com/Dao-AILab/flash-attention/blob/main/hopper/test_flash_attn_triton_amd.py#L628-L959
 
