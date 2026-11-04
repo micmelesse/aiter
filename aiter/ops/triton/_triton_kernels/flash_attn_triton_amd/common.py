@@ -30,17 +30,19 @@ def attention_mask(
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
+    RELATIVE_MASK: tl.constexpr = False,
 ):
     """Allowed query/key pairs; negative window sizes mean unbounded."""
     allowed = (offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
-    if USE_SLIDING_WINDOW:
+    if USE_SLIDING_WINDOW or RELATIVE_MASK:
         relative = offs_n[None, :] - offs_m[:, None] - (seqlen_k - seqlen_q)
         if IS_CAUSAL:
             allowed = allowed & (relative <= 0)
-        if WINDOW_SIZE_LEFT >= 0:
-            allowed = allowed & (relative >= -WINDOW_SIZE_LEFT)
-        if WINDOW_SIZE_RIGHT >= 0:
-            allowed = allowed & (relative <= WINDOW_SIZE_RIGHT)
+        if USE_SLIDING_WINDOW:
+            if WINDOW_SIZE_LEFT >= 0:
+                allowed = allowed & (relative >= -WINDOW_SIZE_LEFT)
+            if WINDOW_SIZE_RIGHT >= 0:
+                allowed = allowed & (relative <= WINDOW_SIZE_RIGHT)
     elif IS_CAUSAL:
         query_pos = offs_m[:, None] + seqlen_k - seqlen_q
         allowed = allowed & (offs_n[None, :] <= query_pos)
