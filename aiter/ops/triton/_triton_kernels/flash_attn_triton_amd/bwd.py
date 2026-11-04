@@ -3799,6 +3799,7 @@ def _bwd_causal_dq_tile(
             USE_SLIDING_WINDOW,
             WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT,
+            ACTUAL_HEAD_DIM_QK <= 128 and ACTUAL_HEAD_DIM_V <= 128,
         )
     shifted = tl.where(m == float("-inf"), float("-inf"), logits - m)
     if APPLY_MASK:
