@@ -287,11 +287,8 @@ def bwd(
             (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
         )
 
-    # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
-    if rng_state is not None:
-        philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
-    else:
-        philox_seed, philox_offset = None, None
+    if dropout_p > 0.0 and rng_state is None:
+        raise ValueError("dropout backward needs the forward's rng_state")
 
     if alibi_slopes is not None:
         if alibi_slopes.dim() == 2:
@@ -326,8 +323,7 @@ def bwd(
         seqused_q=None,
         seqused_k=None,
         dropout_p=dropout_p,
-        philox_seed=philox_seed,
-        philox_offset=philox_offset,
+        rng_state=rng_state,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
         window_size_left=window_size_left,
@@ -633,11 +629,8 @@ def varlen_bwd(
     else:
         delta = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
 
-    # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
-    if rng_state is not None:
-        philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
-    else:
-        philox_seed, philox_offset = None, None
+    if dropout_p > 0.0 and rng_state is None:
+        raise ValueError("dropout backward needs the forward's rng_state")
 
     if alibi_slopes is not None:
         if alibi_slopes.dim() == 2:
@@ -672,8 +665,7 @@ def varlen_bwd(
         seqused_q=None,
         seqused_k=None,
         dropout_p=dropout_p,
-        philox_seed=philox_seed,
-        philox_offset=philox_offset,
+        rng_state=rng_state,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
         window_size_left=window_size_left,

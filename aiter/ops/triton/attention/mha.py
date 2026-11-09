@@ -1051,7 +1051,6 @@ class _FlashAttnFunc(torch.autograd.Function):
     ):
         implementation = _resolve_implementation(implementation)
         ctx.implementation = implementation
-        ctx.head_sizes = (q.shape[-1], k.shape[-1], v.shape[-1])
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
         )
@@ -1466,7 +1465,6 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
     ):
         implementation = _resolve_implementation(implementation)
         ctx.implementation = implementation
-        ctx.head_sizes = (q.shape[-1], k.shape[-1], v.shape[-1])
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
         )

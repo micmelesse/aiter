@@ -521,7 +521,6 @@ def bwd(
 
     # V3 backward doesn't have dropout or alibi slopes
     dropout_p = 0.0
-    philox_seed, philox_offset = None, None
     alibi_slopes = None
 
     # Call implementation
@@ -549,8 +548,7 @@ def bwd(
         seqused_q=seqused_q,
         seqused_k=seqused_k,
         dropout_p=dropout_p,
-        philox_seed=philox_seed,
-        philox_offset=philox_offset,
+        rng_state=None,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
         window_size_left=window_size_left,
