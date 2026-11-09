@@ -882,6 +882,152 @@ def _flash_attn_forward(
     return o, softmax_lse, s_dmask, philox_seed, philox_offset, rng_state
 
 
+def _flash_attn_backward(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dbias: torch.Tensor | None,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    alibi_slopes: torch.Tensor | None,
+    deterministic: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    philox_seed: int | None = None,
+    philox_offset: int | None = None,
+    rng_state: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    dsink: torch.Tensor | None = None,
+    implementation: Literal["default", "dao_ai"] | None = None,
+) -> torch.Tensor | None:
+    """Write the gradients into dq, dk, dv (and dbias, dsink) for a forward of
+    _flash_attn_forward. Pass the forward's dropout state: philox_seed and philox_offset
+    for the default implementation, rng_state for dao_ai.
+
+    Returns the softmax delta for dao_ai and None for default.
+    """
+    implementation = _resolve_implementation(implementation)
+    if implementation == "dao_ai":
+        assert sink is None, "dao_ai impl does not support attention sink."
+        if cu_seqlens_q is None:
+            return flash_attn_2.bwd(
+                do,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                softcap=0.0,
+                deterministic=deterministic,
+                rng_state=rng_state,
+            )[3]
+        return flash_attn_2.varlen_bwd(
+            do,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            alibi_slopes,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            zero_tensors=False,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            softcap=0.0,
+            deterministic=deterministic,
+            rng_state=rng_state,
+        )[3]
+
+    sliding_window = max(window_size_left, 0)
+    if _USE_FUSED_BWD_KERNEL:
+        if sliding_window > 0:
+            raise ValueError(
+                "Fused backward doesn't support sliding window attention. "
+                "Disable fused backward or use the one-kernel backward."
+            )
+        assert sink is None and dsink is None, "Fused backward doesn't support sinks."
+        flash_attn_fused_backward(
+            do,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            softmax_scale,
+            alibi_slopes,
+            causal,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset=philox_offset,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        )
+    else:
+        flash_attn_onekernel_backward(
+            do,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            softmax_scale,
+            alibi_slopes,
+            causal,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset=philox_offset,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+            sink=sink,
+            dsink=dsink,
+            sliding_window=sliding_window,
+        )
+    return None
+
+
 class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -967,90 +1113,33 @@ class _FlashAttnFunc(torch.autograd.Function):
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-        sliding_window = _get_sliding_window_size(ctx.window_size)
-
-        if ctx.implementation == "dao_ai":
-            assert sink is None, "dao_ai impl does not support attention sink."
-            flash_attn_2.bwd(
-                do_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                ctx.alibi_slopes,
-                ctx.dropout_p,
-                ctx.softmax_scale,
-                ctx.causal,
-                window_size_left=ctx.window_size[0],
-                window_size_right=ctx.window_size[1],
-                softcap=0.0,
-                deterministic=ctx.deterministic,
-                rng_state=ctx.rng_state,
-            )
-        else:
-            if _USE_FUSED_BWD_KERNEL:
-                if sliding_window > 0:
-                    raise ValueError(
-                        "Fused backward doesn't support sliding window attention. "
-                        "Disable fused backward or use the one-kernel backward."
-                    )
-                assert (
-                    sink is None and dsink is None
-                ), "Fused backward doesn't support sinks."
-                flash_attn_fused_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    None,
-                    None,
-                    max_seqlen_q=q.shape[1],
-                    max_seqlen_k=k.shape[1],
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                )
-            else:
-                flash_attn_onekernel_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    None,
-                    None,
-                    max_seqlen_q=q.shape[1],
-                    max_seqlen_k=k.shape[1],
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                    sink=sink,
-                    dsink=dsink,
-                    sliding_window=sliding_window,
-                )
+        _flash_attn_backward(
+            do_padded,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            int(ctx.window_size[0]),
+            int(ctx.window_size[1]),
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            philox_seed=ctx.philox_seed,
+            philox_offset=ctx.philox_offset,
+            rng_state=ctx.rng_state,
+            sink=sink,
+            dsink=dsink,
+            implementation=ctx.implementation,
+        )
 
         dq = dq[..., : ctx.head_sizes[0]]
         dk = dk[..., : ctx.head_sizes[1]]
@@ -1444,95 +1533,35 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         do_padded = do
         if head_size_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
-        sliding_window = _get_sliding_window_size(ctx.window_size)
-
-        if ctx.implementation == "dao_ai":
-            assert sink is None, "dao_ai impl does not support attention sink."
-            flash_attn_2.varlen_bwd(
-                do_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                ctx.alibi_slopes,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                dropout_p=ctx.dropout_p,
-                softmax_scale=ctx.softmax_scale,
-                zero_tensors=False,
-                causal=ctx.causal,
-                window_size_left=ctx.window_size[0],
-                window_size_right=ctx.window_size[1],
-                softcap=0.0,
-                deterministic=ctx.deterministic,
-                rng_state=ctx.rng_state,
-            )
-        else:
-            if _USE_FUSED_BWD_KERNEL:
-                if sliding_window > 0:
-                    raise ValueError(
-                        "Fused backward doesn't support sliding window attention. "
-                        "Disable fused backward or use the one-kernel backward."
-                    )
-                assert (
-                    sink is None and dsink is None
-                ), "Fused backward doesn't support sinks."
-                flash_attn_fused_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q=ctx.max_seqlen_q,
-                    max_seqlen_k=ctx.max_seqlen_k,
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                )
-            else:
-                flash_attn_onekernel_backward(
-                    do_padded,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    dq,
-                    dk,
-                    dv,
-                    dbias,
-                    ctx.softmax_scale,
-                    ctx.alibi_slopes,
-                    ctx.causal,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q=ctx.max_seqlen_q,
-                    max_seqlen_k=ctx.max_seqlen_k,
-                    dropout_p=ctx.dropout_p,
-                    philox_seed=ctx.philox_seed,
-                    philox_offset=ctx.philox_offset,
-                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                    sink=sink,
-                    dsink=dsink,
-                    sliding_window=sliding_window,
-                )
+        _flash_attn_backward(
+            do_padded,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            int(ctx.window_size[0]),
+            int(ctx.window_size[1]),
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            philox_seed=ctx.philox_seed,
+            philox_offset=ctx.philox_offset,
+            rng_state=ctx.rng_state,
+            sink=sink,
+            dsink=dsink,
+            implementation=ctx.implementation,
+        )
 
         dq = dq[..., : ctx.head_sizes[0]]
         dk = dk[..., : ctx.head_sizes[1]]
