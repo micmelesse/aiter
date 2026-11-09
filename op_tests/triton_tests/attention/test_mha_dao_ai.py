@@ -339,6 +339,41 @@ def test_mha_dao_ai_mxfp8_selector(default, implementation, message):
         mha_set_impl("default")
 
 
+@pytest.mark.parametrize("return_softmax", [False, True])
+@pytest.mark.parametrize("varlen", [False, True])
+def test_mha_dao_ai_forward_returns_match_flash_attention(varlen, return_softmax):
+    """FlashAttention's fake ops declare rng_state on q's device and the dropout record in
+    q's dtype, empty when not requested; torch.compile fails on anything else."""
+    q = torch.randn(2, 128, 4, 64, device="cuda", dtype=torch.float16)
+    seqlens = {}
+    if varlen:
+        q = q.flatten(0, 1)
+        cu_seqlens = torch.arange(0, 3 * 128, 128, device="cuda", dtype=torch.int32)
+        seqlens = {"cu_seqlens_q": cu_seqlens, "cu_seqlens_k": cu_seqlens}
+    _, _, s_dmask, _, _, rng_state = mha._flash_attn_forward(
+        q,
+        q,
+        q,
+        0.17,
+        64**-0.5,
+        True,
+        -1,
+        -1,
+        None,
+        None,
+        True,
+        return_softmax,
+        128,
+        128,
+        **seqlens,
+        implementation="dao_ai",
+    )
+    assert rng_state.device == q.device
+    assert rng_state.shape == (2,) and rng_state.dtype == torch.int64
+    assert s_dmask.dtype == q.dtype
+    assert s_dmask.shape == ((2, 4, 128, 128) if return_softmax else (0,))
+
+
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 def test_mha_dao_ai_dropout_backward(varlen, causal):

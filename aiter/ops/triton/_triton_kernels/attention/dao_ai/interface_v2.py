@@ -21,11 +21,6 @@ from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
     round_multiple,
 )
 
-# Built once at import, not per call: a per-call alloc inherits the default
-# device and does an illegal H2D under CUDA graph capture.
-# Keep it on the CPU: bwd reads it with .item() and needs no GPU sync.
-_RNG_STATE = torch.tensor([PHILOX_SEED, PHILOX_OFFSET], device="cpu", dtype=torch.int64)
-
 
 def fwd(
     q: torch.Tensor,
@@ -91,7 +86,11 @@ def fwd(
 
     # Dropout + RNG seed
     philox_seed, philox_offset = PHILOX_SEED, PHILOX_OFFSET
-    rng_state = _RNG_STATE
+    # FlashAttention's fake ops declare rng_state on the device. Fill kernels, not a host
+    # copy, so CUDA graph capture stays legal.
+    rng_state = torch.empty(2, dtype=torch.int64, device=q.device)
+    rng_state[0].fill_(PHILOX_SEED)
+    rng_state[1].fill_(PHILOX_OFFSET)
 
     # argument checks
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
@@ -212,9 +211,12 @@ def fwd(
                 and sd_mask.shape[1] == q.shape[2]
                 and sd_mask.shape[2] == q.shape[1]
             ), f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
-    else:
-        assert sd_mask is None, "[fwd] return_softmax=False but sd_mask is not None"
 
+    # FlashAttention's fake ops declare sd_mask in q's dtype, and empty when not requested.
+    if return_softmax:
+        sd_mask = sd_mask.to(q.dtype)
+    else:
+        sd_mask = torch.empty((0,), dtype=q.dtype, device=q.device)
     return out, softmax_lse, sd_mask, rng_state
 
 
@@ -460,7 +462,11 @@ def varlen_fwd(
         assert alibi_slopes.shape == (batch, nheads_q)
 
     philox_seed, philox_offset = PHILOX_SEED, PHILOX_OFFSET
-    rng_state = _RNG_STATE
+    # FlashAttention's fake ops declare rng_state on the device. Fill kernels, not a host
+    # copy, so CUDA graph capture stays legal.
+    rng_state = torch.empty(2, dtype=torch.int64, device=q.device)
+    rng_state[0].fill_(PHILOX_SEED)
+    rng_state[1].fill_(PHILOX_OFFSET)
 
     # Inline checks (subset appropriate for varlen)
     assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3
@@ -542,10 +548,10 @@ def varlen_fwd(
             assert (
                 sd_mask.shape[2] == max_seqlen_q and sd_mask.shape[3] == max_seqlen_k
             ), f"[varlen_fwd] sd_mask shape {sd_mask.shape} != (B={batch}, Hq={q.shape[1]}, Sq={max_seqlen_q}, Sk={max_seqlen_k})"
+    if return_softmax:
+        sd_mask = sd_mask.to(q.dtype)
     else:
-        assert (
-            sd_mask is None
-        ), "[varlen_fwd] return_softmax=False but sd_mask is not None"
+        sd_mask = torch.empty((0,), dtype=q.dtype, device=q.device)
     return out, softmax_lse, sd_mask, rng_state
 
 
