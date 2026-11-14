@@ -1,3 +1,4 @@
+import os
 import warnings
 from typing import Literal
 
@@ -3202,6 +3203,14 @@ def _bwd_dq_inner(
             rand_vals = tl.rand(philox_seed, philox_offs)
             dropout_mask = rand_vals > dropout_p
             dropout_scale = 1 / (1 - dropout_p)
+            # DEBUG(dq-dropout-mask): record the keep mask this loop generates.
+            tl.store(
+                dropout_offset
+                + offs_m[:, None] * stride_dropoutm
+                + offs_n[None, :] * stride_dropoutn,
+                tl.where(dropout_mask, 1.0, -1.0),
+                mask=mask_mn,
+            )
 
         if IS_FP8:
             qk = tl.dot(q, kT) * descale_q * descale_k
@@ -5043,6 +5052,9 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
             )
+        # DEBUG(dq-dropout-mask): save the dQ loop's keep mask for the reproducer.
+        if use_dropout and os.environ.get("AITER_DQ_MASK_DUMP"):
+            torch.save(dropout_mask.cpu(), os.environ["AITER_DQ_MASK_DUMP"])
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1
         WAVES_PER_EU = 1
