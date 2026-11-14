@@ -1,3 +1,5 @@
+import json
+import os
 import warnings
 from typing import Literal
 
@@ -156,6 +158,11 @@ def get_bwd_configs(mode: AutotuneMode):
                     num_warps=4,
                 ),
             ]
+            # DEBUG(bwd-cfg-override): try a causal config from the environment.
+            if os.environ.get("AITER_DEBUG_BWD_CAUSAL_CFG"):
+                _c = json.loads(os.environ["AITER_DEBUG_BWD_CAUSAL_CFG"])
+                _w, _st = _c.pop("num_warps", 4), _c.pop("num_stages", 1)
+                causal_configs = [triton.Config(_c, num_stages=_st, num_warps=_w)]
         elif arch.is_rdna:
             preprocess_configs = [
                 triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
